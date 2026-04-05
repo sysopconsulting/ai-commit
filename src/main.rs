@@ -1,12 +1,14 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
 pub mod config;
 pub mod diff;
 pub mod git;
+pub mod hook;
 pub mod llm;
 pub mod prompt;
 pub mod scope;
+pub mod setup;
 pub mod token;
 pub mod ui;
 
@@ -68,6 +70,77 @@ enum HookAction {
     Uninstall,
 }
 
+async fn generate(cli: &Cli) -> Result<()> {
+    let cfg = config::load()?;
+    let repo = git::repo_root()?;
+    let files = git::staged_files(&repo)?;
+    let (file_count, ins, del) = git::staged_summary(&repo)?;
+
+    if !cli.dry_run && cli.hook.is_none() {
+        ui::print_summary(file_count, ins, del);
+    }
+
+    let detected_scope = scope::detect_scope(&files);
+    let system_prompt = prompt::build_system_prompt(&cfg, detected_scope.as_deref());
+    let (diff_text, _diff_mode) = diff::fit_diff(&repo, cfg.max_input_tokens, &cfg.diff_mode)?;
+
+    let mut user_content = diff_text;
+    if let Some(ctx) = &cli.context {
+        user_content = format!("Context: {ctx}\n\n{user_content}");
+    }
+
+    let messages = vec![
+        llm::Message { role: llm::Role::System, content: system_prompt },
+        llm::Message { role: llm::Role::User, content: user_content },
+    ];
+
+    let provider = llm::Provider::from_config(&cfg)?;
+
+    loop {
+        let mut stream = provider.chat_stream(messages.clone()).await?;
+        let message = ui::stream_message(&mut stream).await?;
+
+        // Hook mode: write to commit message file and exit
+        if let Some(ref hook_path) = cli.hook {
+            std::fs::write(hook_path, &message)?;
+            return Ok(());
+        }
+
+        // Dry-run mode
+        if cli.dry_run {
+            return Ok(());
+        }
+
+        // Auto-confirm mode
+        if cli.yes {
+            git::commit(&repo, &message)?;
+            return Ok(());
+        }
+
+        // Interactive mode
+        match ui::prompt_action()? {
+            ui::Action::Commit => {
+                git::commit(&repo, &message)?;
+                return Ok(());
+            }
+            ui::Action::Edit => {
+                let edited = ui::edit_message(&message)?;
+                if !edited.is_empty() {
+                    git::commit(&repo, &edited)?;
+                }
+                return Ok(());
+            }
+            ui::Action::Regenerate => {
+                eprintln!();
+                continue;
+            }
+            ui::Action::Cancel => {
+                return Ok(());
+            }
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -75,21 +148,25 @@ async fn main() -> Result<()> {
     match cli.command {
         Some(Command::Config { action }) => match action {
             ConfigAction::Set { pair } => {
-                println!("config set: {pair}");
+                let (key, value) = pair.split_once('=')
+                    .context("expected key=value format")?;
+                config::set_value(&config::config_path(), key.trim(), value.trim())?;
+                eprintln!("set {} = {}", key.trim(), value.trim());
             }
             ConfigAction::Show => {
-                println!("config show");
+                let cfg = config::load()?;
+                println!("{}", config::display(&cfg));
             }
         },
         Some(Command::Setup) => {
-            println!("setup");
+            setup::run().await?;
         }
         Some(Command::Hook { action }) => match action {
-            HookAction::Install => println!("hook install"),
-            HookAction::Uninstall => println!("hook uninstall"),
+            HookAction::Install => hook::install()?,
+            HookAction::Uninstall => hook::uninstall()?,
         },
         None => {
-            println!("generate commit message (not yet implemented)");
+            generate(&cli).await?;
         }
     }
 
