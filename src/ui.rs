@@ -2,7 +2,7 @@ use anyhow::Result;
 use crossterm::event::{read, Event, KeyCode, KeyModifiers};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use futures::StreamExt;
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 
 use crate::llm::TokenStream;
 
@@ -67,7 +67,11 @@ pub fn prompt_action() -> Result<Action> {
 }
 
 /// Ask user whether to stage all changes. Returns true if yes.
+/// Returns false silently if not running in a TTY.
 pub fn prompt_stage() -> Result<bool> {
+    if !std::io::stdin().is_terminal() {
+        return Ok(false);
+    }
     eprint!("  Stage all changes? [y/n] > ");
     io::stderr().flush()?;
 
@@ -89,7 +93,11 @@ pub fn prompt_stage() -> Result<bool> {
 }
 
 /// Ask user whether to push after commit. Returns true if yes.
+/// Returns false silently if not running in a TTY.
 pub fn prompt_push() -> Result<bool> {
+    if !std::io::stdin().is_terminal() {
+        return Ok(false);
+    }
     eprint!("  Push? [y/n] > ");
     io::stderr().flush()?;
 
