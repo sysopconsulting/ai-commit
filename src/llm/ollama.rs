@@ -20,7 +20,10 @@ impl OllamaProvider {
             .clone()
             .unwrap_or_else(|| "http://localhost:11434".into());
         OllamaProvider {
-            client: reqwest::Client::new(),
+            client: reqwest::Client::builder()
+                .connect_timeout(std::time::Duration::from_secs(10))
+                .build()
+                .unwrap_or_default(),
             api_url,
             model: config.model.clone(),
         }

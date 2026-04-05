@@ -13,6 +13,10 @@ pub fn build_system_prompt(config: &Config, scope: Option<&str>) -> String {
         "- One line unless the changes are complex enough to warrant a body".to_string(),
     ];
 
+    if config.one_line {
+        lines.push("- Output only a single-line commit message, no body".to_string());
+    }
+
     if config.emoji {
         lines.push("- Prefix the subject with a relevant emoji".to_string());
     }
@@ -110,6 +114,14 @@ mod tests {
             prompt.contains("ja"),
             "Prompt should contain the language code 'ja'"
         );
+    }
+
+    #[test]
+    fn prompt_includes_one_line_instruction() {
+        let mut config = Config::default();
+        config.one_line = true;
+        let prompt = build_system_prompt(&config, None);
+        assert!(prompt.contains("single-line"), "should mention single-line: {prompt}");
     }
 
     // 7. Basic sanity: prompt is not empty with default config

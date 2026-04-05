@@ -10,7 +10,11 @@ pub fn truncate_to_tokens(text: &str, max_tokens: usize) -> String {
         return text.to_string();
     }
     let max_bytes = (max_tokens as f64 * 3.2) as usize;
-    let truncated = &text[..max_bytes.min(text.len())];
+    let mut end = max_bytes.min(text.len());
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    let truncated = &text[..end];
     match truncated.rfind('\n') {
         Some(pos) => truncated[..=pos].to_string(),
         None => truncated.to_string(),
@@ -44,6 +48,14 @@ mod tests {
     fn truncate_returns_full_if_fits() {
         let text = "short text";
         assert_eq!(truncate_to_tokens(text, 100), text);
+    }
+
+    #[test]
+    fn truncate_handles_multibyte_utf8() {
+        let text = "日本語のテスト\n二行目\n三行目\n";
+        let result = truncate_to_tokens(text, 3);
+        assert!(estimate_tokens(&result) <= 3);
+        assert!(!result.is_empty());
     }
 
     #[test]
