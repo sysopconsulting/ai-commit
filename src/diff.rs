@@ -37,6 +37,15 @@ impl DiffMode {
     }
 }
 
+/// Get the next smaller diff mode for retry on context-length error.
+pub fn next_smaller_mode(mode: DiffMode) -> Option<DiffMode> {
+    match mode {
+        DiffMode::Full => Some(DiffMode::Compact),
+        DiffMode::Compact => Some(DiffMode::Stat),
+        DiffMode::Stat => None,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Core pure logic
 // ---------------------------------------------------------------------------
@@ -106,6 +115,25 @@ mod tests {
     use std::fs;
     use std::process::Command;
     use tempfile::tempdir;
+
+    // -----------------------------------------------------------------------
+    // Unit tests for next_smaller_mode
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn next_smaller_from_full_is_compact() {
+        assert_eq!(next_smaller_mode(DiffMode::Full), Some(DiffMode::Compact));
+    }
+
+    #[test]
+    fn next_smaller_from_compact_is_stat() {
+        assert_eq!(next_smaller_mode(DiffMode::Compact), Some(DiffMode::Stat));
+    }
+
+    #[test]
+    fn next_smaller_from_stat_is_none() {
+        assert_eq!(next_smaller_mode(DiffMode::Stat), None);
+    }
 
     // -----------------------------------------------------------------------
     // Unit tests for select_diff (pure, no git)

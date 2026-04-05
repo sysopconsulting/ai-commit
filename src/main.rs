@@ -82,22 +82,46 @@ async fn generate(cli: &Cli) -> Result<()> {
 
     let detected_scope = scope::detect_scope(&files);
     let system_prompt = prompt::build_system_prompt(&cfg, detected_scope.as_deref());
-    let (diff_text, _diff_mode) = diff::fit_diff(&repo, cfg.max_input_tokens, &cfg.diff_mode)?;
-
-    let mut user_content = diff_text;
-    if let Some(ctx) = &cli.context {
-        user_content = format!("Context: {ctx}\n\n{user_content}");
-    }
-
-    let messages = vec![
-        llm::Message { role: llm::Role::System, content: system_prompt },
-        llm::Message { role: llm::Role::User, content: user_content },
-    ];
+    let (initial_diff, initial_mode) = diff::fit_diff(&repo, cfg.max_input_tokens, &cfg.diff_mode)?;
 
     let provider = llm::Provider::from_config(&cfg)?;
 
+    let mut current_diff = initial_diff;
+    let mut current_mode = initial_mode;
+    let mut retries: u32 = 0;
+
     loop {
-        let mut stream = provider.chat_stream(messages.clone()).await?;
+        let mut user_content = current_diff.clone();
+        if let Some(ctx) = &cli.context {
+            user_content = format!("Context: {ctx}\n\n{user_content}");
+        }
+
+        let messages = vec![
+            llm::Message { role: llm::Role::System, content: system_prompt.clone() },
+            llm::Message { role: llm::Role::User, content: user_content },
+        ];
+
+        let stream_result = provider.chat_stream(messages).await;
+        let mut stream = match stream_result {
+            Ok(s) => s,
+            Err(e) => {
+                let msg = e.to_string().to_lowercase();
+                let is_context_error = msg.contains("context")
+                    || msg.contains("too long")
+                    || msg.contains("maximum")
+                    || msg.contains("token");
+                if is_context_error && retries < 2 {
+                    if let Some(smaller_mode) = diff::next_smaller_mode(current_mode) {
+                        current_diff = diff::get_forced_diff(&repo, smaller_mode)?;
+                        current_mode = smaller_mode;
+                        retries += 1;
+                        continue;
+                    }
+                }
+                return Err(e);
+            }
+        };
+
         let message = ui::stream_message(&mut stream).await?;
 
         // Hook mode: write to commit message file and exit
