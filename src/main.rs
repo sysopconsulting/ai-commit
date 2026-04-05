@@ -8,6 +8,7 @@ pub mod llm;
 pub mod prompt;
 pub mod scope;
 pub mod token;
+pub mod ui;
 
 #[derive(Parser)]
 #[command(name = "acm", about = "AI commit message generator")]
