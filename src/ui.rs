@@ -47,8 +47,8 @@ pub fn prompt_action() -> Result<Action> {
 
     enable_raw_mode()?;
     let action = loop {
-        match read()? {
-            Event::Key(key) => match (key.code, key.modifiers) {
+        if let Event::Key(key) = read()? {
+            match (key.code, key.modifiers) {
                 (KeyCode::Char('c'), KeyModifiers::CONTROL) => break Action::Cancel,
                 (KeyCode::Char('y'), _) => break Action::Commit,
                 (KeyCode::Enter, _) => break Action::Commit,
@@ -57,8 +57,7 @@ pub fn prompt_action() -> Result<Action> {
                 (KeyCode::Char('n'), _) => break Action::Cancel,
                 (KeyCode::Esc, _) => break Action::Cancel,
                 _ => {}
-            },
-            _ => {}
+            }
         }
     };
     disable_raw_mode()?;

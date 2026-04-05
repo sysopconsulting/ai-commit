@@ -26,13 +26,15 @@ impl fmt::Display for DiffMode {
     }
 }
 
-impl DiffMode {
-    pub fn from_str(s: &str) -> Option<DiffMode> {
+impl std::str::FromStr for DiffMode {
+    type Err = ();
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
-            "full" => Some(DiffMode::Full),
-            "compact" => Some(DiffMode::Compact),
-            "stat" => Some(DiffMode::Stat),
-            _ => None,
+            "full" => Ok(DiffMode::Full),
+            "compact" => Ok(DiffMode::Compact),
+            "stat" => Ok(DiffMode::Stat),
+            _ => Err(()),
         }
     }
 }
@@ -91,8 +93,9 @@ pub fn get_forced_diff(repo: &Path, mode: DiffMode) -> Result<String> {
 /// * Otherwise compute all three variants and call [`select_diff`].
 pub fn fit_diff(repo: &Path, max_tokens: usize, forced_mode: &str) -> Result<(String, DiffMode)> {
     if forced_mode != "auto" {
-        let mode = DiffMode::from_str(forced_mode)
-            .ok_or_else(|| anyhow::anyhow!("unknown diff mode: {}", forced_mode))?;
+        let mode = forced_mode
+            .parse::<DiffMode>()
+            .map_err(|_| anyhow::anyhow!("unknown diff mode: {}", forced_mode))?;
         let diff = get_forced_diff(repo, mode)?;
         return Ok((diff, mode));
     }

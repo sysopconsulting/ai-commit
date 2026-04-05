@@ -58,9 +58,7 @@ impl OpenAiProvider {
             anyhow::bail!("API returned {}: {}", status, body_text);
         }
 
-        let byte_stream = response.bytes_stream().map_err(|e| {
-            std::io::Error::new(std::io::ErrorKind::Other, e)
-        });
+        let byte_stream = response.bytes_stream().map_err(std::io::Error::other);
         let stream_reader = StreamReader::new(byte_stream);
         let buf_reader = BufReader::new(stream_reader);
         let lines: Lines<BufReader<StreamReader<_, _>>> = buf_reader.lines();
