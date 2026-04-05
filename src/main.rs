@@ -2,6 +2,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 
 pub mod config;
+pub mod diff;
 pub mod git;
 pub mod token;
 
