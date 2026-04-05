@@ -143,7 +143,13 @@ async fn generate(cli: &Cli) -> Result<()> {
             }
         };
 
-        let message = ui::stream_message(&mut stream).await?;
+        let raw_message = ui::stream_message(&mut stream).await?;
+        let message = prompt::clean_message(&raw_message);
+
+        // Show cleaned message if it differs from raw (preamble was stripped)
+        if message != raw_message.trim() {
+            eprintln!("\n  (cleaned)\n{message}");
+        }
 
         // Hook mode: write to commit message file and exit
         if let Some(ref hook_path) = cli.hook {
