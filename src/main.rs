@@ -70,10 +70,31 @@ enum HookAction {
     Uninstall,
 }
 
+fn maybe_push(repo: &std::path::Path) -> Result<()> {
+    if ui::prompt_push()? {
+        git::push(repo)?;
+    }
+    Ok(())
+}
+
 async fn generate(cli: &Cli) -> Result<()> {
     let cfg = config::load()?;
     let repo = git::repo_root()?;
-    let files = git::staged_files(&repo)?;
+
+    // If nothing staged, offer to stage all changes
+    let files = match git::staged_files(&repo) {
+        Ok(f) => f,
+        Err(_) if git::has_unstaged_changes(&repo) => {
+            eprintln!("  No staged changes, but unstaged changes detected.\n");
+            if cli.yes || ui::prompt_stage()? {
+                git::stage_all(&repo)?;
+                git::staged_files(&repo)?
+            } else {
+                anyhow::bail!("no staged changes. Stage files with \"git add\" first.");
+            }
+        }
+        Err(e) => return Err(e),
+    };
     let (file_count, ins, del) = git::staged_summary(&repo)?;
 
     if !cli.dry_run && cli.hook.is_none() {
@@ -138,6 +159,7 @@ async fn generate(cli: &Cli) -> Result<()> {
         // Auto-confirm mode
         if cli.yes {
             git::commit(&repo, &message)?;
+            maybe_push(&repo)?;
             return Ok(());
         }
 
@@ -145,12 +167,14 @@ async fn generate(cli: &Cli) -> Result<()> {
         match ui::prompt_action()? {
             ui::Action::Commit => {
                 git::commit(&repo, &message)?;
+                maybe_push(&repo)?;
                 return Ok(());
             }
             ui::Action::Edit => {
                 let edited = ui::edit_message(&message)?;
                 if !edited.is_empty() {
                     git::commit(&repo, &edited)?;
+                    maybe_push(&repo)?;
                 }
                 return Ok(());
             }

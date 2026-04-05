@@ -66,6 +66,50 @@ pub fn prompt_action() -> Result<Action> {
     Ok(action)
 }
 
+/// Ask user whether to stage all changes. Returns true if yes.
+pub fn prompt_stage() -> Result<bool> {
+    eprint!("  Stage all changes? [y/n] > ");
+    io::stderr().flush()?;
+
+    enable_raw_mode()?;
+    let yes = loop {
+        if let Event::Key(key) = read()? {
+            match (key.code, key.modifiers) {
+                (KeyCode::Char('c'), KeyModifiers::CONTROL) => break false,
+                (KeyCode::Char('y'), _) | (KeyCode::Enter, _) => break true,
+                (KeyCode::Char('n'), _) | (KeyCode::Esc, _) => break false,
+                _ => {}
+            }
+        }
+    };
+    disable_raw_mode()?;
+    eprintln!();
+
+    Ok(yes)
+}
+
+/// Ask user whether to push after commit. Returns true if yes.
+pub fn prompt_push() -> Result<bool> {
+    eprint!("  Push? [y/n] > ");
+    io::stderr().flush()?;
+
+    enable_raw_mode()?;
+    let yes = loop {
+        if let Event::Key(key) = read()? {
+            match (key.code, key.modifiers) {
+                (KeyCode::Char('c'), KeyModifiers::CONTROL) => break false,
+                (KeyCode::Char('y'), _) => break true,
+                (KeyCode::Char('n'), _) | (KeyCode::Enter, _) | (KeyCode::Esc, _) => break false,
+                _ => {}
+            }
+        }
+    };
+    disable_raw_mode()?;
+    eprintln!();
+
+    Ok(yes)
+}
+
 pub fn edit_message(message: &str) -> Result<String> {
     let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".into());
     let tmp = tempfile::NamedTempFile::new()?;

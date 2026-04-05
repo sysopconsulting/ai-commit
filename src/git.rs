@@ -69,9 +69,29 @@ pub fn staged_summary(repo: &Path) -> Result<(usize, usize, usize)> {
     Ok((files, insertions, deletions))
 }
 
+/// Returns true if there are unstaged or untracked changes in the working tree.
+pub fn has_unstaged_changes(repo: &Path) -> bool {
+    // Check for modified/deleted tracked files + untracked files
+    git_in(repo, &["status", "--porcelain"])
+        .map(|out| !out.is_empty())
+        .unwrap_or(false)
+}
+
+/// Stage all changes (tracked + untracked) in the repo.
+pub fn stage_all(repo: &Path) -> Result<()> {
+    git_in(repo, &["add", "-A"])?;
+    Ok(())
+}
+
 /// Runs `git commit -m <message>` in `repo`.
 pub fn commit(repo: &Path, message: &str) -> Result<()> {
     git_in(repo, &["commit", "-m", message])?;
+    Ok(())
+}
+
+/// Push the current branch to origin.
+pub fn push(repo: &Path) -> Result<()> {
+    git_in(repo, &["push"])?;
     Ok(())
 }
 
