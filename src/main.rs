@@ -2,6 +2,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 
 pub mod config;
+pub mod git;
 
 #[derive(Parser)]
 #[command(name = "acm", about = "AI commit message generator")]
