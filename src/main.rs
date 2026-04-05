@@ -4,6 +4,7 @@ use clap::{Parser, Subcommand};
 pub mod config;
 pub mod diff;
 pub mod git;
+pub mod scope;
 pub mod token;
 
 #[derive(Parser)]
