@@ -1,6 +1,8 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
+pub mod config;
+
 #[derive(Parser)]
 #[command(name = "acm", about = "AI commit message generator")]
 struct Cli {
