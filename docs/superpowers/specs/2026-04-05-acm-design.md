@@ -52,9 +52,9 @@ trait LlmProvider {
 
 Both Ollama and OpenAI-compatible implement this. To display the full message, collect the stream. No separate non-streaming path.
 
-### No Token Counting Library
+### Token Estimation (Heuristic-Based)
 
-Use char-based estimation: `string.len() / 4`. Intentionally conservative. If the estimate undershoots and the API rejects with a context-length error, retry with the next-smaller diff mode. This eliminates the 1.2MB tiktoken WASM dependency.
+Use char-based estimation: `string.len() / 3.2`. Intentionally conservative for code. If the estimate undershoots and the API rejects with a context-length error, the system silently retries with the next-smaller diff mode (max 2 retries). This eliminates the 1.2MB tiktoken WASM dependency.
 
 ### Progressive Diff Reduction
 
@@ -81,7 +81,13 @@ fn fit_diff(staged_files, max_tokens, forced_mode) -> String:
     return truncate(stat, max_tokens)
 ```
 
-If the API still rejects (estimation was off), catch the context-length error and retry one level down. Maximum 2 retries.
+### Intelligent Scope Detection
+
+Auto-detect commit scope from file paths to ensure consistency:
+1. Find the deepest common directory among all staged files.
+2. Strip common prefixes: `src/`, `pkg/`, `libs/`, `apps/`.
+3. If a non-empty string remains, use it as the scope (e.g., `src/auth/login.rs` -> `auth`).
+4. If files are scattered or in the root, omit the scope.
 
 ## Config
 
@@ -211,7 +217,7 @@ No per-provider SDK. No WASM. No git library (shell out to `git`). Single static
 |--------------------|-------------|
 | Splits large diffs into N LLM calls, concatenates N messages | Progressive diff reduction: always 1 call, 1 coherent message |
 | 4.6MB JS bundle + Node.js runtime | 3-5MB static binary, no runtime |
-| Tiktoken WASM for token counting (1.2MB) | char/4 estimation + retry on API rejection |
+| Tiktoken WASM for token counting (1.2MB) | char/3.2 estimation + retry on API rejection |
 | Bundles all 12 provider SDKs | One HTTP client, two API formats |
 | No streaming — blocks until complete | Streams tokens live |
 | 800+ token prompt with fake examples | Minimal prompt, max room for diff |
