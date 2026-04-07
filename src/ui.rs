@@ -118,6 +118,18 @@ pub fn prompt_push() -> Result<bool> {
     Ok(yes)
 }
 
+/// Print `--stat` output for files about to be staged, indented.
+pub fn print_unstaged_stat(stat: &str) {
+    if stat.is_empty() {
+        return;
+    }
+    eprintln!();
+    for line in stat.lines() {
+        eprintln!("  {line}");
+    }
+    eprintln!();
+}
+
 pub fn edit_message(message: &str) -> Result<String> {
     let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".into());
     let tmp = tempfile::NamedTempFile::new()?;

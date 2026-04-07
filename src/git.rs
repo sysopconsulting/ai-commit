@@ -69,6 +69,44 @@ pub fn staged_summary(repo: &Path) -> Result<(usize, usize, usize)> {
     Ok((files, insertions, deletions))
 }
 
+/// Returns `git status --porcelain` output (one line per changed/untracked file).
+pub fn working_tree_status(repo: &Path) -> Result<String> {
+    git_in(repo, &["status", "--porcelain"])
+}
+
+/// Returns `git diff --cached --stat` output.
+pub fn unstaged_stat(repo: &Path) -> Result<String> {
+    git_in(repo, &["diff", "--stat"])
+}
+
+/// Show the staged diff in a pager (`$PAGER` or `less -R`).
+/// Blocks until the user quits the pager.
+pub fn show_staged_diff_paged(repo: &Path) -> Result<()> {
+    let pager = std::env::var("PAGER").unwrap_or_else(|_| "less -R".into());
+    let parts: Vec<&str> = pager.split_whitespace().collect();
+    let (cmd, args) = parts.split_first().unwrap_or((&"less", &["-R"][..]));
+
+    let diff_output = std::process::Command::new("git")
+        .args(["diff", "--cached", "--color=always"])
+        .current_dir(repo)
+        .output()
+        .context("failed to run git diff --cached")?;
+
+    let mut child = std::process::Command::new(cmd)
+        .args(args)
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .with_context(|| format!("failed to spawn pager: {pager}"))?;
+
+    if let Some(mut stdin) = child.stdin.take() {
+        use std::io::Write;
+        let _ = stdin.write_all(&diff_output.stdout);
+    }
+
+    child.wait().context("pager exited with error")?;
+    Ok(())
+}
+
 /// Returns true if there are unstaged or untracked changes in the working tree.
 pub fn has_unstaged_changes(repo: &Path) -> bool {
     // Check for modified/deleted tracked files + untracked files

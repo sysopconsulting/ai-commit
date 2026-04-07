@@ -85,7 +85,10 @@ async fn generate(cli: &Cli) -> Result<()> {
     let files = match git::staged_files(&repo) {
         Ok(f) => f,
         Err(_) if git::has_unstaged_changes(&repo) => {
-            eprintln!("  No staged changes, but unstaged changes detected.\n");
+            eprintln!("  No staged changes, but unstaged changes detected.");
+            if let Ok(stat) = git::unstaged_stat(&repo) {
+                ui::print_unstaged_stat(&stat);
+            }
             if cli.yes || ui::prompt_stage()? {
                 git::stage_all(&repo)?;
                 git::staged_files(&repo)?
@@ -168,6 +171,10 @@ async fn generate(cli: &Cli) -> Result<()> {
             maybe_push(&repo)?;
             return Ok(());
         }
+
+        // Show staged diff in pager before asking
+        git::show_staged_diff_paged(&repo)?;
+        eprintln!("\n{message}\n");
 
         // Interactive mode
         match ui::prompt_action()? {
