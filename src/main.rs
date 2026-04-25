@@ -47,6 +47,22 @@ mod cli_tests {
             Some(env!("CARGO_PKG_VERSION"))
         );
     }
+
+    #[test]
+    fn only_interactive_commit_flow_shows_diff_before_generation() {
+        assert!(should_show_diff_before_generation(false, false, false));
+        assert!(!should_show_diff_before_generation(true, false, false));
+        assert!(!should_show_diff_before_generation(false, true, false));
+        assert!(!should_show_diff_before_generation(false, false, true));
+    }
+
+    #[test]
+    fn unchanged_streamed_message_is_not_printed_again() {
+        assert!(!should_print_cleaned_message(
+            "feat(.): ignore target and .codex files\n",
+            "feat(.): ignore target and .codex files"
+        ));
+    }
 }
 
 #[derive(Subcommand)]
@@ -91,6 +107,14 @@ fn maybe_push(repo: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
+fn should_show_diff_before_generation(yes: bool, dry_run: bool, hook: bool) -> bool {
+    !yes && !dry_run && !hook
+}
+
+fn should_print_cleaned_message(raw_message: &str, cleaned_message: &str) -> bool {
+    cleaned_message != raw_message.trim()
+}
+
 async fn generate(cli: &Cli) -> Result<()> {
     let cfg = config::load()?;
     let repo = git::repo_root()?;
@@ -123,6 +147,10 @@ async fn generate(cli: &Cli) -> Result<()> {
     let (initial_diff, initial_mode) = diff::fit_diff(&repo, cfg.max_input_tokens, &cfg.diff_mode)?;
 
     let provider = llm::Provider::from_config(&cfg)?;
+
+    if should_show_diff_before_generation(cli.yes, cli.dry_run, cli.hook.is_some()) {
+        git::show_staged_diff_paged(&repo)?;
+    }
 
     let mut current_diff = initial_diff;
     let mut current_mode = initial_mode;
@@ -171,7 +199,7 @@ async fn generate(cli: &Cli) -> Result<()> {
         let message = prompt::clean_message(&raw_message);
 
         // Show cleaned message if it differs from raw (preamble was stripped)
-        if message != raw_message.trim() {
+        if should_print_cleaned_message(&raw_message, &message) {
             eprintln!("\n  (cleaned)\n{message}");
         }
 
@@ -192,10 +220,6 @@ async fn generate(cli: &Cli) -> Result<()> {
             maybe_push(&repo)?;
             return Ok(());
         }
-
-        // Show staged diff in pager before asking
-        git::show_staged_diff_paged(&repo)?;
-        eprintln!("\n{message}\n");
 
         // Interactive mode
         match ui::prompt_action()? {
