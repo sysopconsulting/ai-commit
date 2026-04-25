@@ -23,7 +23,10 @@ pub fn build_system_prompt(config: &Config, scope: Option<&str>) -> String {
     }
 
     if config.language != "en" {
-        lines.push(format!("- Write the message in language: {}", config.language));
+        lines.push(format!(
+            "- Write the message in language: {}",
+            config.language
+        ));
     }
 
     if let Some(s) = scope {
@@ -54,10 +57,7 @@ pub fn clean_message(raw: &str) -> String {
             .unwrap_or(raw)
             .trim_start_matches(|c: char| c != '\n')
             .trim_start_matches('\n');
-        inner
-            .strip_suffix("```")
-            .unwrap_or(inner)
-            .trim()
+        inner.strip_suffix("```").unwrap_or(inner).trim()
     } else {
         raw
     };
@@ -93,10 +93,9 @@ pub fn clean_message(raw: &str) -> String {
 
 fn is_commit_line(line: &str) -> bool {
     let lower = line.trim().to_lowercase();
-    TYPES.iter().any(|t| {
-        lower.starts_with(&format!("{t}:"))
-            || lower.starts_with(&format!("{t}("))
-    })
+    TYPES
+        .iter()
+        .any(|t| lower.starts_with(&format!("{t}:")) || lower.starts_with(&format!("{t}(")))
 }
 
 fn is_commentary(line: &str) -> bool {
@@ -131,10 +130,7 @@ mod tests {
             prompt.contains("commit message"),
             "Should mention 'commit message'"
         );
-        assert!(
-            prompt.contains("imperative"),
-            "Should mention 'imperative'"
-        );
+        assert!(prompt.contains("imperative"), "Should mention 'imperative'");
         assert!(
             prompt.contains("max 72 chars"),
             "Should mention 'max 72 chars'"
@@ -166,8 +162,10 @@ mod tests {
     // 4. Emoji instruction present when emoji=true
     #[test]
     fn prompt_includes_emoji_instruction() {
-        let mut config = Config::default();
-        config.emoji = true;
+        let config = Config {
+            emoji: true,
+            ..Config::default()
+        };
         let prompt = build_system_prompt(&config, None);
         assert!(
             prompt.contains("emoji"),
@@ -178,8 +176,10 @@ mod tests {
     // 5. No emoji mention when emoji=false
     #[test]
     fn prompt_omits_emoji_when_disabled() {
-        let mut config = Config::default();
-        config.emoji = false;
+        let config = Config {
+            emoji: false,
+            ..Config::default()
+        };
         let prompt = build_system_prompt(&config, None);
         assert!(
             !prompt.contains("emoji"),
@@ -190,8 +190,10 @@ mod tests {
     // 6. Language instruction included when language is not English
     #[test]
     fn prompt_includes_language_when_not_english() {
-        let mut config = Config::default();
-        config.language = "ja".to_string();
+        let config = Config {
+            language: "ja".to_string(),
+            ..Config::default()
+        };
         let prompt = build_system_prompt(&config, None);
         assert!(
             prompt.contains("ja"),
@@ -201,10 +203,15 @@ mod tests {
 
     #[test]
     fn prompt_includes_one_line_instruction() {
-        let mut config = Config::default();
-        config.one_line = true;
+        let config = Config {
+            one_line: true,
+            ..Config::default()
+        };
         let prompt = build_system_prompt(&config, None);
-        assert!(prompt.contains("single-line"), "should mention single-line: {prompt}");
+        assert!(
+            prompt.contains("single-line"),
+            "should mention single-line: {prompt}"
+        );
     }
 
     // 7. Basic sanity: prompt is not empty with default config
@@ -242,7 +249,8 @@ mod tests {
 
     #[test]
     fn clean_strips_trailing_commentary() {
-        let raw = "feat(ui): add dark mode toggle\n\n(Note: I used feat because this is a new feature.)";
+        let raw =
+            "feat(ui): add dark mode toggle\n\n(Note: I used feat because this is a new feature.)";
         assert_eq!(clean_message(raw), "feat(ui): add dark mode toggle");
     }
 
@@ -267,6 +275,9 @@ mod tests {
     #[test]
     fn clean_handles_type_without_scope() {
         let raw = "Some explanation.\n\nfix: resolve null pointer on empty input";
-        assert_eq!(clean_message(raw), "fix: resolve null pointer on empty input");
+        assert_eq!(
+            clean_message(raw),
+            "fix: resolve null pointer on empty input"
+        );
     }
 }

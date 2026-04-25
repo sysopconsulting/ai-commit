@@ -54,12 +54,7 @@ pub fn next_smaller_mode(mode: DiffMode) -> Option<DiffMode> {
 
 /// Try full → compact → stat in order. If stat still exceeds `max_tokens`,
 /// truncate it. Returns the selected text and the mode used.
-pub fn select_diff(
-    full: &str,
-    compact: &str,
-    stat: &str,
-    max_tokens: usize,
-) -> (String, DiffMode) {
+pub fn select_diff(full: &str, compact: &str, stat: &str, max_tokens: usize) -> (String, DiffMode) {
     if token::estimate_tokens(full) <= max_tokens {
         return (full.to_string(), DiffMode::Full);
     }

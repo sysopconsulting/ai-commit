@@ -1,4 +1,4 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -76,7 +76,18 @@ pub fn working_tree_status(repo: &Path) -> Result<String> {
 
 /// Returns `git diff --cached --stat` output.
 pub fn unstaged_stat(repo: &Path) -> Result<String> {
-    git_in(repo, &["diff", "--stat"])
+    let mut output = git_in(repo, &["diff", "--stat"])?;
+    let untracked = git_in(repo, &["ls-files", "--others", "--exclude-standard"])?;
+    if !untracked.is_empty() {
+        if !output.is_empty() {
+            output.push('\n');
+        }
+        for file in untracked.lines() {
+            output.push_str(&format!(" {file} | untracked\n"));
+        }
+        output = output.trim_end().to_string();
+    }
+    Ok(output)
 }
 
 /// Show the staged diff in a pager (`$PAGER` or `less -R`).
@@ -123,7 +134,17 @@ pub fn stage_all(repo: &Path) -> Result<()> {
 
 /// Runs `git commit -m <message>` in `repo`.
 pub fn commit(repo: &Path, message: &str) -> Result<()> {
-    git_in(repo, &["commit", "-m", message])?;
+    let output = Command::new("git")
+        .args(["commit", "-m", message])
+        .current_dir(repo)
+        .env("ACM_SKIP_HOOK", "1")
+        .output()
+        .context("Failed to run: git commit")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        bail!("git commit: {}", stderr)
+    }
     Ok(())
 }
 
@@ -149,11 +170,22 @@ pub fn repo_root() -> Result<PathBuf> {
     }
 }
 
+/// Resolve a path inside Git's private directory, including linked worktrees.
+pub fn git_path(repo: &Path, pathspec: &str) -> Result<PathBuf> {
+    let output = git_in(repo, &["rev-parse", "--git-path", pathspec])?;
+    let path = PathBuf::from(output);
+    if path.is_absolute() {
+        Ok(path)
+    } else {
+        Ok(repo.join(path))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::fs;
-    use tempfile::{tempdir, TempDir};
+    use tempfile::{TempDir, tempdir};
 
     /// Create an isolated git repo with an initial commit.
     fn init_repo() -> TempDir {
@@ -300,10 +332,8 @@ mod tests {
         // may echo the nearby function/context label, so we check for lines starting with ' '.
         let compact = staged_diff(path, Some(0)).unwrap();
 
-        let context_lines_present: Vec<&str> = compact
-            .lines()
-            .filter(|l| l.starts_with(' '))
-            .collect();
+        let context_lines_present: Vec<&str> =
+            compact.lines().filter(|l| l.starts_with(' ')).collect();
         assert!(
             context_lines_present.is_empty(),
             "Compact diff should have no context lines (lines starting with ' '), got: {context_lines_present:?}"
@@ -331,6 +361,20 @@ mod tests {
         assert!(
             stat.contains("stat_test.txt"),
             "Stat should mention filename, got: {stat}"
+        );
+    }
+
+    #[test]
+    fn unstaged_stat_includes_untracked_files() {
+        let repo = init_repo();
+        let path = repo.path();
+
+        fs::write(path.join("untracked.txt"), "new content\n").unwrap();
+
+        let stat = unstaged_stat(path).unwrap();
+        assert!(
+            stat.contains("untracked.txt"),
+            "Unstaged stat should mention untracked file, got: {stat:?}"
         );
     }
 
@@ -375,5 +419,36 @@ mod tests {
             log.contains("my test commit message"),
             "Expected commit message in log, got: {log}"
         );
+    }
+
+    #[test]
+    fn commit_skips_acm_prepare_commit_msg_hook() {
+        let repo = init_repo();
+        let path = repo.path();
+        let hooks_dir = path.join(".git/hooks");
+        fs::create_dir_all(&hooks_dir).unwrap();
+        fs::write(
+            hooks_dir.join("prepare-commit-msg"),
+            "#!/bin/sh\n[ \"$ACM_SKIP_HOOK\" = \"1\" ] || exit 42\n",
+        )
+        .unwrap();
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let hook = hooks_dir.join("prepare-commit-msg");
+            let mut perms = fs::metadata(&hook).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&hook, perms).unwrap();
+        }
+
+        fs::write(path.join("skip_hook.txt"), "content\n").unwrap();
+        Command::new("git")
+            .args(["add", "skip_hook.txt"])
+            .current_dir(path)
+            .output()
+            .unwrap();
+
+        commit(path, "commit through acm").unwrap();
     }
 }

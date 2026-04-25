@@ -1,6 +1,6 @@
+use crate::config;
 use anyhow::Result;
 use std::io::{self, BufRead, Write};
-use crate::config;
 
 pub async fn run() -> Result<()> {
     let mut stdout = io::stdout();
@@ -14,7 +14,11 @@ pub async fn run() -> Result<()> {
     let provider = read_line_or_default(&stdin, "ollama")?;
 
     // 2. Model
-    let default_model = if provider == "ollama" { "llama3" } else { "gpt-4o" };
+    let default_model = if provider == "ollama" {
+        "llama3"
+    } else {
+        "gpt-4o"
+    };
     eprint!("Model (default: {default_model}): ");
     stdout.flush()?;
     let model = read_line_or_default(&stdin, default_model)?;
@@ -76,7 +80,11 @@ fn read_line(stdin: &io::Stdin) -> Result<String> {
 
 fn read_line_or_default(stdin: &io::Stdin, default: &str) -> Result<String> {
     let line = read_line(stdin)?;
-    Ok(if line.is_empty() { default.to_string() } else { line })
+    Ok(if line.is_empty() {
+        default.to_string()
+    } else {
+        line
+    })
 }
 
 async fn test_connection(provider: &str, api_url: &str, api_key: Option<&str>) -> bool {

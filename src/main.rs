@@ -13,7 +13,7 @@ pub mod token;
 pub mod ui;
 
 #[derive(Parser)]
-#[command(name = "acm", about = "AI commit message generator")]
+#[command(name = "acm", about = "AI commit message generator", version)]
 struct Cli {
     /// Skip confirmation, commit directly
     #[arg(short = 'y', long)]
@@ -33,6 +33,20 @@ struct Cli {
 
     #[command(subcommand)]
     command: Option<Command>,
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    #[test]
+    fn cli_exposes_package_version() {
+        assert_eq!(
+            Cli::command().get_version(),
+            Some(env!("CARGO_PKG_VERSION"))
+        );
+    }
 }
 
 #[derive(Subcommand)]
@@ -121,8 +135,14 @@ async fn generate(cli: &Cli) -> Result<()> {
         }
 
         let messages = vec![
-            llm::Message { role: llm::Role::System, content: system_prompt.clone() },
-            llm::Message { role: llm::Role::User, content: user_content },
+            llm::Message {
+                role: llm::Role::System,
+                content: system_prompt.clone(),
+            },
+            llm::Message {
+                role: llm::Role::User,
+                content: user_content,
+            },
         ];
 
         let stream_result = provider.chat_stream(messages).await;
@@ -134,13 +154,14 @@ async fn generate(cli: &Cli) -> Result<()> {
                     || msg.contains("too long")
                     || msg.contains("maximum")
                     || msg.contains("token");
-                if is_context_error && retries < 2 {
-                    if let Some(smaller_mode) = diff::next_smaller_mode(current_mode) {
-                        current_diff = diff::get_forced_diff(&repo, smaller_mode)?;
-                        current_mode = smaller_mode;
-                        retries += 1;
-                        continue;
-                    }
+                if is_context_error
+                    && retries < 2
+                    && let Some(smaller_mode) = diff::next_smaller_mode(current_mode)
+                {
+                    current_diff = diff::get_forced_diff(&repo, smaller_mode)?;
+                    current_mode = smaller_mode;
+                    retries += 1;
+                    continue;
                 }
                 return Err(e);
             }
@@ -209,8 +230,7 @@ async fn main() -> Result<()> {
     match cli.command {
         Some(Command::Config { action }) => match action {
             ConfigAction::Set { pair } => {
-                let (key, value) = pair.split_once('=')
-                    .context("expected key=value format")?;
+                let (key, value) = pair.split_once('=').context("expected key=value format")?;
                 config::set_value(&config::config_path(), key.trim(), value.trim())?;
                 eprintln!("set {} = {}", key.trim(), value.trim());
             }

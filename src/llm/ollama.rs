@@ -1,11 +1,11 @@
 use anyhow::{Context, Result};
-use futures::stream::unfold;
 use futures::TryStreamExt;
+use futures::stream::unfold;
 use tokio::io::{AsyncBufReadExt, BufReader, Lines};
 use tokio_util::io::StreamReader;
 
-use crate::config::Config;
 use super::{Message, TokenStream};
+use crate::config::Config;
 
 pub struct OllamaProvider {
     client: reqwest::Client,
@@ -60,7 +60,11 @@ impl OllamaProvider {
             );
         }
         if !status.is_success() {
-            anyhow::bail!("Ollama returned error status: {}", status);
+            let body_text = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "<unreadable body>".into());
+            anyhow::bail!("{}", format_ollama_error(status, &body_text));
         }
 
         let byte_stream = response.bytes_stream().map_err(std::io::Error::other);
@@ -79,7 +83,7 @@ impl OllamaProvider {
                     }
                     Ok(None) => return None,
                     Err(e) => {
-                        return Some((Err(anyhow::anyhow!("stream read error: {}", e)), lines))
+                        return Some((Err(anyhow::anyhow!("stream read error: {}", e)), lines));
                     }
                 }
             }
@@ -101,13 +105,23 @@ pub fn parse_ollama_line(line: &str) -> Option<String> {
     }
 }
 
+fn format_ollama_error(status: reqwest::StatusCode, body: &str) -> String {
+    let body = body.trim();
+    if body.is_empty() {
+        format!("Ollama returned error status: {status}")
+    } else {
+        format!("Ollama returned {status}: {body}")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn parse_content_token() {
-        let line = r#"{"model":"llama3","message":{"role":"assistant","content":"Hello"},"done":false}"#;
+        let line =
+            r#"{"model":"llama3","message":{"role":"assistant","content":"Hello"},"done":false}"#;
         assert_eq!(parse_ollama_line(line), Some("Hello".to_string()));
     }
 
@@ -126,5 +140,14 @@ mod tests {
     fn parse_missing_message_returns_none() {
         let line = r#"{"model":"llama3","done":true}"#;
         assert_eq!(parse_ollama_line(line), None);
+    }
+
+    #[test]
+    fn error_message_includes_response_body() {
+        let err = format_ollama_error(reqwest::StatusCode::BAD_REQUEST, "context length exceeded");
+        assert!(
+            err.contains("context length exceeded"),
+            "error should include response body, got: {err}"
+        );
     }
 }

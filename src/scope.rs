@@ -128,10 +128,7 @@ mod tests {
 
     #[test]
     fn mixed_root_and_subdir_returns_none() {
-        assert_eq!(
-            detect_scope(&s(&["src/auth/login.rs", "README.md"])),
-            None
-        );
+        assert_eq!(detect_scope(&s(&["src/auth/login.rs", "README.md"])), None);
     }
 
     #[test]

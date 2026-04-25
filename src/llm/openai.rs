@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
-use futures::stream::unfold;
 use futures::TryStreamExt;
+use futures::stream::unfold;
 use tokio::io::{AsyncBufReadExt, BufReader, Lines};
 use tokio_util::io::StreamReader;
 
@@ -16,10 +16,9 @@ pub struct OpenAiProvider {
 
 impl OpenAiProvider {
     pub fn new(config: &Config) -> Result<Self> {
-        let api_key = config
-            .api_key
-            .clone()
-            .ok_or_else(|| anyhow::anyhow!("ACM_API_KEY not set. Run \"acm config set api_key=<key>\""))?;
+        let api_key = config.api_key.clone().ok_or_else(|| {
+            anyhow::anyhow!("ACM_API_KEY not set. Run \"acm config set api_key=<key>\"")
+        })?;
         let api_url = config
             .api_url
             .clone()
@@ -77,7 +76,7 @@ impl OpenAiProvider {
                     }
                     Ok(None) => return None,
                     Err(e) => {
-                        return Some((Err(anyhow::anyhow!("stream read error: {}", e)), lines))
+                        return Some((Err(anyhow::anyhow!("stream read error: {}", e)), lines));
                     }
                 }
             }

@@ -48,8 +48,9 @@ pub fn load_from_path(path: &PathBuf) -> Result<Config> {
     }
     let content = std::fs::read_to_string(path)
         .with_context(|| format!("Failed to read config file: {}", path.display()))?;
-    toml::from_str(&content)
-        .with_context(|| format!("Invalid TOML in config file: {}", path.display()))
+    let cfg: Config = toml::from_str(&content)
+        .with_context(|| format!("Invalid TOML in config file: {}", path.display()))?;
+    validate(cfg)
 }
 
 /// Load config from default path + apply env overrides.
@@ -57,7 +58,7 @@ pub fn load() -> Result<Config> {
     let path = config_path();
     let mut cfg = load_from_path(&path)?;
     apply_env_overrides(&mut cfg);
-    Ok(cfg)
+    validate(cfg)
 }
 
 /// Apply all ACM_* environment variable overrides to the config.
@@ -79,6 +80,26 @@ pub fn apply_env_overrides(cfg: &mut Config) {
     for (key, value) in overrides {
         apply_env_override(cfg, key, value.as_deref());
     }
+}
+
+fn validate(cfg: Config) -> Result<Config> {
+    match cfg.provider.as_str() {
+        "ollama" | "openai" => {}
+        other => anyhow::bail!("unknown provider: {other}. Use \"ollama\" or \"openai\"."),
+    }
+
+    match cfg.diff_mode.as_str() {
+        "auto" | "full" | "compact" | "stat" => {}
+        other => anyhow::bail!(
+            "unknown diff_mode: {other}. Use \"auto\", \"full\", \"compact\", or \"stat\"."
+        ),
+    }
+
+    if cfg.max_input_tokens == 0 {
+        anyhow::bail!("max_input_tokens must be greater than 0");
+    }
+
+    Ok(cfg)
 }
 
 /// Apply a single environment variable override to the config (testable).
@@ -148,8 +169,12 @@ pub fn set_value(path: &PathBuf, key: &str, value: &str) -> Result<()> {
 
     table.insert(key.to_string(), toml_value);
 
-    let output = toml::to_string_pretty(&table)
-        .with_context(|| "Failed to serialize config to TOML")?;
+    let output =
+        toml::to_string_pretty(&table).with_context(|| "Failed to serialize config to TOML")?;
+    let cfg: Config =
+        toml::from_str(&output).with_context(|| format!("Invalid config value for key: {key}"))?;
+    validate(cfg)?;
+
     std::fs::write(path, output)
         .with_context(|| format!("Failed to write config file: {}", path.display()))?;
 
@@ -162,11 +187,7 @@ pub fn display(cfg: &Config) -> String {
         Some(_) => "(set)".to_string(),
         None => "(not set)".to_string(),
     };
-    let api_url_display = cfg
-        .api_url
-        .as_deref()
-        .unwrap_or("(not set)")
-        .to_string();
+    let api_url_display = cfg.api_url.as_deref().unwrap_or("(not set)").to_string();
 
     format!(
         "provider         = {}\nmodel            = {}\napi_url          = {}\napi_key          = {}\nmax_input_tokens = {}\nemoji            = {}\none_line         = {}\nlanguage         = {}\ndiff_mode        = {}",
@@ -229,18 +250,18 @@ model = "gpt-4o"
         let mut f = NamedTempFile::new().unwrap();
         writeln!(
             f,
-            r#"provider = "anthropic"
-model = "claude-3-5-sonnet"
-api_key = "sk-ant-test"
+            r#"provider = "openai"
+model = "gpt-4o"
+api_key = "sk-test"
 max_input_tokens = 8192
 emoji = true
 "#
         )
         .unwrap();
         let cfg = load_from_path(&f.path().to_path_buf()).unwrap();
-        assert_eq!(cfg.provider, "anthropic");
-        assert_eq!(cfg.model, "claude-3-5-sonnet");
-        assert_eq!(cfg.api_key.as_deref(), Some("sk-ant-test"));
+        assert_eq!(cfg.provider, "openai");
+        assert_eq!(cfg.model, "gpt-4o");
+        assert_eq!(cfg.api_key.as_deref(), Some("sk-test"));
         assert_eq!(cfg.max_input_tokens, 8192);
         assert!(cfg.emoji);
     }
@@ -366,8 +387,10 @@ emoji = true
 
     #[test]
     fn test_display_masks_api_key() {
-        let mut cfg = Config::default();
-        cfg.api_key = Some("super-secret-key".to_string());
+        let cfg = Config {
+            api_key: Some("super-secret-key".to_string()),
+            ..Config::default()
+        };
         let out = display(&cfg);
         assert!(
             !out.contains("super-secret-key"),
@@ -383,6 +406,29 @@ emoji = true
         assert!(
             out.contains("(not set)"),
             "Should show '(not set)' when api_key is None"
+        );
+    }
+
+    #[test]
+    fn test_load_rejects_unknown_provider() {
+        let mut f = NamedTempFile::new().unwrap();
+        writeln!(f, r#"provider = "anthropic""#).unwrap();
+        let err = load_from_path(&f.path().to_path_buf()).unwrap_err();
+        assert!(
+            err.to_string().contains("unknown provider"),
+            "Expected provider validation error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_set_value_rejects_invalid_diff_mode() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("config.toml");
+
+        let err = set_value(&path, "diff_mode", "staged").unwrap_err();
+        assert!(
+            err.to_string().contains("unknown diff_mode"),
+            "Expected diff_mode validation error, got: {err}"
         );
     }
 }

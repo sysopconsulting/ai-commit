@@ -62,7 +62,10 @@ mod tests {
     fn truncate_cuts_to_fit() {
         let text = "line1\nline2\nline3\nline4\nline5\nline6\nline7\nline8\n";
         let result = truncate_to_tokens(text, 5);
-        assert!(estimate_tokens(&result) <= 5, "truncated should fit: {result}");
+        assert!(
+            estimate_tokens(&result) <= 5,
+            "truncated should fit: {result}"
+        );
         assert!(!result.is_empty());
     }
 }

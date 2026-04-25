@@ -1,5 +1,5 @@
 use anyhow::Result;
-use crossterm::event::{read, Event, KeyCode, KeyModifiers};
+use crossterm::event::{Event, KeyCode, KeyModifiers, read};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use futures::StreamExt;
 use std::io::{self, IsTerminal, Write};
@@ -14,10 +14,28 @@ pub enum Action {
     Cancel,
 }
 
+struct RawModeGuard;
+
+impl RawModeGuard {
+    fn enable() -> Result<Self> {
+        enable_raw_mode()?;
+        Ok(Self)
+    }
+}
+
+impl Drop for RawModeGuard {
+    fn drop(&mut self) {
+        let _ = disable_raw_mode();
+    }
+}
+
 pub fn print_summary(files: usize, insertions: usize, deletions: usize) {
     let file_word = if files == 1 { "file" } else { "files" };
     if insertions > 0 || deletions > 0 {
-        eprintln!("  Staged: {} {} (+{}, -{})", files, file_word, insertions, deletions);
+        eprintln!(
+            "  Staged: {} {} (+{}, -{})",
+            files, file_word, insertions, deletions
+        );
     } else {
         eprintln!("  Staged: {} {}", files, file_word);
     }
@@ -45,7 +63,7 @@ pub fn prompt_action() -> Result<Action> {
     eprint!("  [y]es  [e]dit  [r]egenerate  [n]o  > ");
     io::stderr().flush()?;
 
-    enable_raw_mode()?;
+    let raw_mode = RawModeGuard::enable()?;
     let action = loop {
         if let Event::Key(key) = read()? {
             match (key.code, key.modifiers) {
@@ -60,7 +78,7 @@ pub fn prompt_action() -> Result<Action> {
             }
         }
     };
-    disable_raw_mode()?;
+    drop(raw_mode);
     eprintln!();
 
     Ok(action)
@@ -75,7 +93,7 @@ pub fn prompt_stage() -> Result<bool> {
     eprint!("  Stage all changes? [y/n] > ");
     io::stderr().flush()?;
 
-    enable_raw_mode()?;
+    let raw_mode = RawModeGuard::enable()?;
     let yes = loop {
         if let Event::Key(key) = read()? {
             match (key.code, key.modifiers) {
@@ -86,7 +104,7 @@ pub fn prompt_stage() -> Result<bool> {
             }
         }
     };
-    disable_raw_mode()?;
+    drop(raw_mode);
     eprintln!();
 
     Ok(yes)
@@ -101,7 +119,7 @@ pub fn prompt_push() -> Result<bool> {
     eprint!("  Push? [y/n] > ");
     io::stderr().flush()?;
 
-    enable_raw_mode()?;
+    let raw_mode = RawModeGuard::enable()?;
     let yes = loop {
         if let Event::Key(key) = read()? {
             match (key.code, key.modifiers) {
@@ -112,7 +130,7 @@ pub fn prompt_push() -> Result<bool> {
             }
         }
     };
-    disable_raw_mode()?;
+    drop(raw_mode);
     eprintln!();
 
     Ok(yes)
@@ -132,13 +150,35 @@ pub fn print_unstaged_stat(stat: &str) {
 
 pub fn edit_message(message: &str) -> Result<String> {
     let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".into());
+    let (cmd, args) = split_editor_command(&editor);
     let tmp = tempfile::NamedTempFile::new()?;
     std::fs::write(tmp.path(), message)?;
 
-    std::process::Command::new(&editor)
+    std::process::Command::new(cmd)
+        .args(args)
         .arg(tmp.path())
         .status()?;
 
     let content = std::fs::read_to_string(tmp.path())?;
     Ok(content.trim().to_string())
+}
+
+fn split_editor_command(editor: &str) -> (String, Vec<String>) {
+    let mut parts = editor.split_whitespace();
+    let cmd = parts.next().unwrap_or("vi").to_string();
+    let args = parts.map(|part| part.to_string()).collect();
+    (cmd, args)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::split_editor_command;
+
+    #[test]
+    fn split_editor_command_handles_args() {
+        assert_eq!(
+            split_editor_command("code --wait"),
+            ("code".to_string(), vec!["--wait".to_string()])
+        );
+    }
 }
