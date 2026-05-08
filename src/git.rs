@@ -40,32 +40,110 @@ pub fn staged_diff(repo: &Path, context_lines: Option<u32>) -> Result<String> {
     git_in(repo, &args)
 }
 
-/// Returns `git diff --cached --stat` output.
-pub fn staged_stat(repo: &Path) -> Result<String> {
-    git_in(repo, &["diff", "--cached", "--stat"])
+/// Returns the staged diff for the given files in the order provided.
+/// One git invocation per file so the requested order is preserved
+/// (git's normal `--` pathspec filtering does not preserve argument order).
+pub fn staged_diff_for_files(
+    repo: &Path,
+    context_lines: Option<u32>,
+    files: &[String],
+) -> Result<String> {
+    let mut combined = String::new();
+    for f in files {
+        let mut args: Vec<String> = vec!["diff".into(), "--cached".into()];
+        if let Some(n) = context_lines {
+            args.push(format!("--unified={n}"));
+        }
+        args.push("--".into());
+        args.push(f.clone());
+        let args_ref: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+        let part = git_in(repo, &args_ref)?;
+        if part.is_empty() {
+            continue;
+        }
+        if !combined.is_empty() {
+            combined.push('\n');
+        }
+        combined.push_str(&part);
+    }
+    Ok(combined)
+}
+
+/// Returns per-file numstat for staged changes: `(insertions, deletions, filename)`.
+/// Binary files report `0, 0` (their numstat is `-`).
+pub fn staged_numstat(repo: &Path) -> Result<Vec<(usize, usize, String)>> {
+    let output = git_in(repo, &["diff", "--cached", "--numstat"])?;
+    let mut entries = Vec::new();
+    for line in output.lines() {
+        let parts: Vec<&str> = line.splitn(3, '\t').collect();
+        if parts.len() < 3 {
+            continue;
+        }
+        let added: usize = parts[0].parse().unwrap_or(0);
+        let removed: usize = parts[1].parse().unwrap_or(0);
+        entries.push((added, removed, parts[2].to_string()));
+    }
+    Ok(entries)
+}
+
+/// Returns staged file paths ordered by total lines changed (insertions+deletions), descending.
+/// Ties are broken alphabetically for stable output.
+pub fn staged_files_ranked(repo: &Path) -> Result<Vec<String>> {
+    let mut entries = staged_numstat(repo)?;
+    entries.sort_by(|a, b| {
+        let ta = a.0 + a.1;
+        let tb = b.0 + b.1;
+        tb.cmp(&ta).then_with(|| a.2.cmp(&b.2))
+    });
+    Ok(entries.into_iter().map(|(_, _, f)| f).collect())
+}
+
+/// Custom stat header listing files ranked by lines changed (descending),
+/// followed by the standard "N files changed, X insertions(+), Y deletions(-)" summary.
+pub fn staged_stat_ranked(repo: &Path) -> Result<String> {
+    let mut entries = staged_numstat(repo)?;
+    if entries.is_empty() {
+        return Ok(String::new());
+    }
+    entries.sort_by(|a, b| {
+        let ta = a.0 + a.1;
+        let tb = b.0 + b.1;
+        tb.cmp(&ta).then_with(|| a.2.cmp(&b.2))
+    });
+    let name_w = entries.iter().map(|(_, _, n)| n.len()).max().unwrap_or(0);
+    let total_w = entries
+        .iter()
+        .map(|(a, d, _)| (a + d).to_string().len())
+        .max()
+        .unwrap_or(1);
+    let mut out = String::new();
+    let (mut tot_ins, mut tot_del) = (0usize, 0usize);
+    for (added, removed, name) in &entries {
+        let total = added + removed;
+        out.push_str(&format!(
+            " {name:<name_w$} | {total:>total_w$}  (+{added} -{removed})\n",
+        ));
+        tot_ins += added;
+        tot_del += removed;
+    }
+    out.push_str(&format!(
+        " {} file{} changed, {} insertion{}(+), {} deletion{}(-)",
+        entries.len(),
+        if entries.len() == 1 { "" } else { "s" },
+        tot_ins,
+        if tot_ins == 1 { "" } else { "s" },
+        tot_del,
+        if tot_del == 1 { "" } else { "s" },
+    ));
+    Ok(out)
 }
 
 /// Returns `(file_count, total_insertions, total_deletions)` from `git diff --cached --numstat`.
 pub fn staged_summary(repo: &Path) -> Result<(usize, usize, usize)> {
-    let output = git_in(repo, &["diff", "--cached", "--numstat"])?;
-    let mut files = 0usize;
-    let mut insertions = 0usize;
-    let mut deletions = 0usize;
-
-    for line in output.lines() {
-        // Each line: "<added>\t<removed>\t<filename>"
-        let parts: Vec<&str> = line.splitn(3, '\t').collect();
-        if parts.len() < 2 {
-            continue;
-        }
-        // Binary files show '-' instead of a number
-        let added: usize = parts[0].parse().unwrap_or(0);
-        let removed: usize = parts[1].parse().unwrap_or(0);
-        insertions += added;
-        deletions += removed;
-        files += 1;
-    }
-
+    let entries = staged_numstat(repo)?;
+    let files = entries.len();
+    let insertions: usize = entries.iter().map(|(a, _, _)| *a).sum();
+    let deletions: usize = entries.iter().map(|(_, d, _)| *d).sum();
     Ok((files, insertions, deletions))
 }
 
@@ -346,21 +424,82 @@ mod tests {
     }
 
     #[test]
-    fn staged_stat_returns_stat() {
+    fn staged_stat_ranked_lists_files_in_descending_change_order() {
         let repo = init_repo();
         let path = repo.path();
 
-        fs::write(path.join("stat_test.txt"), "some content\n").unwrap();
+        // Big file: 20 lines added. Small file: 1 line added.
+        let mut big = String::new();
+        for i in 0..20 {
+            big.push_str(&format!("line {i}\n"));
+        }
+        fs::write(path.join("small.txt"), "x\n").unwrap();
+        fs::write(path.join("big.txt"), &big).unwrap();
         Command::new("git")
-            .args(["add", "stat_test.txt"])
+            .args(["add", "small.txt", "big.txt"])
             .current_dir(path)
             .output()
             .unwrap();
 
-        let stat = staged_stat(path).unwrap();
+        let stat = staged_stat_ranked(path).unwrap();
+        let big_pos = stat.find("big.txt").expect("big.txt missing from stat");
+        let small_pos = stat.find("small.txt").expect("small.txt missing from stat");
         assert!(
-            stat.contains("stat_test.txt"),
-            "Stat should mention filename, got: {stat}"
+            big_pos < small_pos,
+            "big.txt should appear before small.txt in ranked stat:\n{stat}"
+        );
+        assert!(
+            stat.contains("2 files changed"),
+            "stat should include summary line, got:\n{stat}"
+        );
+    }
+
+    #[test]
+    fn staged_files_ranked_orders_by_change_size() {
+        let repo = init_repo();
+        let path = repo.path();
+
+        let mut big = String::new();
+        for i in 0..50 {
+            big.push_str(&format!("line {i}\n"));
+        }
+        fs::write(path.join("a_small.txt"), "x\n").unwrap();
+        fs::write(path.join("z_big.txt"), &big).unwrap();
+        Command::new("git")
+            .args(["add", "a_small.txt", "z_big.txt"])
+            .current_dir(path)
+            .output()
+            .unwrap();
+
+        let ranked = staged_files_ranked(path).unwrap();
+        assert_eq!(ranked, vec!["z_big.txt".to_string(), "a_small.txt".to_string()]);
+    }
+
+    #[test]
+    fn staged_diff_for_files_preserves_order() {
+        let repo = init_repo();
+        let path = repo.path();
+
+        fs::write(path.join("alpha.txt"), "alpha-content\n").unwrap();
+        fs::write(path.join("zulu.txt"), "zulu-content\n").unwrap();
+        Command::new("git")
+            .args(["add", "alpha.txt", "zulu.txt"])
+            .current_dir(path)
+            .output()
+            .unwrap();
+
+        let diff = staged_diff_for_files(
+            path,
+            None,
+            &["zulu.txt".to_string(), "alpha.txt".to_string()],
+        )
+        .unwrap();
+
+        let zulu_pos = diff.find("zulu.txt").expect("zulu.txt missing");
+        let alpha_pos = diff.find("alpha.txt").expect("alpha.txt missing");
+        assert!(
+            zulu_pos < alpha_pos,
+            "diff should respect requested file order, got:\n{diff}"
         );
     }
 

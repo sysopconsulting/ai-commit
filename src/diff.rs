@@ -73,19 +73,42 @@ pub fn select_diff(full: &str, compact: &str, stat: &str, max_tokens: usize) -> 
 // Git-backed helpers
 // ---------------------------------------------------------------------------
 
-/// Fetch the diff for a specific mode from the git index.
-pub fn get_forced_diff(repo: &Path, mode: DiffMode) -> Result<String> {
-    match mode {
-        DiffMode::Full => git::staged_diff(repo, None),
-        DiffMode::Compact => git::staged_diff(repo, Some(0)),
-        DiffMode::Stat => git::staged_stat(repo),
+/// Wrap a diff body with a ranked stat header so the model always sees the full
+/// list of changed files (even if the body gets truncated downstream).
+pub fn format_with_stat_header(stat: &str, diff_body: &str) -> String {
+    if stat.is_empty() {
+        return diff_body.to_string();
     }
+    if diff_body.is_empty() {
+        return stat.to_string();
+    }
+    format!("Files changed (ranked by size):\n{stat}\n\n--- diff (largest changes first) ---\n{diff_body}")
+}
+
+/// Fetch the diff for a specific mode from the git index, with files in
+/// importance order and a ranked stat header prepended.
+pub fn get_forced_diff(repo: &Path, mode: DiffMode) -> Result<String> {
+    let stat = git::staged_stat_ranked(repo)?;
+    if matches!(mode, DiffMode::Stat) {
+        return Ok(stat);
+    }
+    let ranked = git::staged_files_ranked(repo)?;
+    let body = match mode {
+        DiffMode::Full => git::staged_diff_for_files(repo, None, &ranked)?,
+        DiffMode::Compact => git::staged_diff_for_files(repo, Some(0), &ranked)?,
+        DiffMode::Stat => unreachable!(),
+    };
+    Ok(format_with_stat_header(&stat, &body))
 }
 
 /// Top-level function.
 ///
 /// * If `forced_mode` is not `"auto"`, fetch that specific diff and return it.
 /// * Otherwise compute all three variants and call [`select_diff`].
+///
+/// Files are ordered by total lines changed (descending), and a ranked stat
+/// header is prepended so the model can reason about every changed file even
+/// if later hunks get truncated.
 pub fn fit_diff(repo: &Path, max_tokens: usize, forced_mode: &str) -> Result<(String, DiffMode)> {
     if forced_mode != "auto" {
         let mode = forced_mode
@@ -95,9 +118,16 @@ pub fn fit_diff(repo: &Path, max_tokens: usize, forced_mode: &str) -> Result<(St
         return Ok((diff, mode));
     }
 
-    let full = git::staged_diff(repo, None)?;
-    let compact = git::staged_diff(repo, Some(0))?;
-    let stat = git::staged_stat(repo)?;
+    let stat = git::staged_stat_ranked(repo)?;
+    let ranked = git::staged_files_ranked(repo)?;
+    let full = format_with_stat_header(
+        &stat,
+        &git::staged_diff_for_files(repo, None, &ranked)?,
+    );
+    let compact = format_with_stat_header(
+        &stat,
+        &git::staged_diff_for_files(repo, Some(0), &ranked)?,
+    );
 
     Ok(select_diff(&full, &compact, &stat, max_tokens))
 }
@@ -293,5 +323,58 @@ mod tests {
             diff.contains("forced.txt"),
             "stat output should mention the staged file, got: {diff}"
         );
+    }
+
+    #[test]
+    fn fit_diff_includes_stat_header_and_ranks_largest_first() {
+        let repo = init_repo();
+        let path = repo.path();
+
+        // Alphabetically, "a_small.txt" comes first — but "z_big.txt" has
+        // many more changes. After the fix, the big file should win the
+        // top spot in both the stat header and the diff body.
+        fs::write(path.join("a_small.txt"), "x\n").unwrap();
+        let mut big = String::new();
+        for i in 0..40 {
+            big.push_str(&format!("line {i}\n"));
+        }
+        fs::write(path.join("z_big.txt"), &big).unwrap();
+        Command::new("git")
+            .args(["add", "a_small.txt", "z_big.txt"])
+            .current_dir(path)
+            .output()
+            .unwrap();
+
+        let (diff, mode) = fit_diff(path, 8192, "auto").expect("fit_diff failed");
+        assert_eq!(mode, DiffMode::Full, "small change set should fit as Full");
+
+        assert!(
+            diff.starts_with("Files changed (ranked by size):"),
+            "diff should start with ranked stat header, got:\n{diff}"
+        );
+        assert!(
+            diff.contains("--- diff"),
+            "diff should contain the diff-section separator, got:\n{diff}"
+        );
+
+        let big_pos = diff.find("z_big.txt").expect("z_big.txt missing");
+        let small_pos = diff.find("a_small.txt").expect("a_small.txt missing");
+        assert!(
+            big_pos < small_pos,
+            "z_big.txt should appear before a_small.txt in the combined output"
+        );
+    }
+
+    #[test]
+    fn format_with_stat_header_combines_in_order() {
+        let result = format_with_stat_header("STAT-LINE", "DIFF-BODY");
+        let stat_pos = result.find("STAT-LINE").unwrap();
+        let diff_pos = result.find("DIFF-BODY").unwrap();
+        assert!(stat_pos < diff_pos);
+    }
+
+    #[test]
+    fn format_with_stat_header_handles_empty_stat() {
+        assert_eq!(format_with_stat_header("", "DIFF"), "DIFF");
     }
 }
