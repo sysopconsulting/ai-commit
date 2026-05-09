@@ -15,12 +15,22 @@ pub fn build_system_prompt(config: &Config, scope: Option<&str>) -> String {
         format_rule.to_string(),
         "- Types: fix, feat, refactor, docs, test, chore, style, perf, build, ci".to_string(),
         "- Subject: imperative, lowercase, no period, max 72 chars".to_string(),
-        "- One line unless the changes are complex enough to warrant a body".to_string(),
+        "- Capture the essence of the change, not just the largest file or most obvious edit"
+            .to_string(),
         "- Output the raw commit message only — do NOT wrap in backticks or markdown".to_string(),
     ];
 
     if config.one_line {
         lines.push("- Output only a single-line commit message, no body".to_string());
+    } else {
+        lines.push(
+            "- For non-trivial commits, add a blank line followed by 2-4 short body lines that summarize why the change matters and the key behavior touched"
+                .to_string(),
+        );
+        lines.push(
+            "- Keep simple docs/style/chore changes as one line when a body would repeat the subject"
+                .to_string(),
+        );
     }
 
     if config.emoji {
@@ -146,6 +156,20 @@ mod tests {
         );
     }
 
+    #[test]
+    fn default_prompt_requests_balanced_body_for_non_trivial_commits() {
+        let config = Config::default();
+        let prompt = build_system_prompt(&config, None);
+        assert!(
+            prompt.contains("Capture the essence"),
+            "Prompt should ask for intent-rich messages: {prompt}"
+        );
+        assert!(
+            prompt.contains("2-4 short body lines"),
+            "Prompt should request a compact body for non-trivial commits: {prompt}"
+        );
+    }
+
     // 2. Scope hint is included when scope is provided
     #[test]
     fn prompt_includes_scope_hint() {
@@ -238,6 +262,10 @@ mod tests {
         assert!(
             prompt.contains("single-line"),
             "should mention single-line: {prompt}"
+        );
+        assert!(
+            !prompt.contains("2-4 short body lines"),
+            "one_line should not include body guidance: {prompt}"
         );
     }
 
