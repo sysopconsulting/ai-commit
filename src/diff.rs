@@ -82,7 +82,9 @@ pub fn format_with_stat_header(stat: &str, diff_body: &str) -> String {
     if diff_body.is_empty() {
         return stat.to_string();
     }
-    format!("Files changed (ranked by size):\n{stat}\n\n--- diff (largest changes first) ---\n{diff_body}")
+    format!(
+        "Files changed (ranked by size):\n{stat}\n\n--- diff (largest changes first) ---\n{diff_body}"
+    )
 }
 
 /// Fetch the diff for a specific mode from the git index, with files in
@@ -120,14 +122,9 @@ pub fn fit_diff(repo: &Path, max_tokens: usize, forced_mode: &str) -> Result<(St
 
     let stat = git::staged_stat_ranked(repo)?;
     let ranked = git::staged_files_ranked(repo)?;
-    let full = format_with_stat_header(
-        &stat,
-        &git::staged_diff_for_files(repo, None, &ranked)?,
-    );
-    let compact = format_with_stat_header(
-        &stat,
-        &git::staged_diff_for_files(repo, Some(0), &ranked)?,
-    );
+    let full = format_with_stat_header(&stat, &git::staged_diff_for_files(repo, None, &ranked)?);
+    let compact =
+        format_with_stat_header(&stat, &git::staged_diff_for_files(repo, Some(0), &ranked)?);
 
     Ok(select_diff(&full, &compact, &stat, max_tokens))
 }

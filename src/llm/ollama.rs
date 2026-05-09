@@ -76,8 +76,10 @@ impl OllamaProvider {
             loop {
                 match lines.next_line().await {
                     Ok(Some(line)) => {
-                        if let Some(token) = parse_ollama_line(&line) {
-                            return Some((Ok(token), lines));
+                        match parse_ollama_line(&line) {
+                            Ok(Some(token)) => return Some((Ok(token), lines)),
+                            Ok(None) => {}
+                            Err(e) => return Some((Err(e), lines)),
                         }
                         // Empty content line — skip and continue
                     }
@@ -95,14 +97,27 @@ impl OllamaProvider {
 
 /// Parse a single NDJSON line from Ollama's streaming response.
 /// Returns the content token if present and non-empty, otherwise None.
-pub fn parse_ollama_line(line: &str) -> Option<String> {
-    let value: serde_json::Value = serde_json::from_str(line).ok()?;
-    let content = value.get("message")?.get("content")?.as_str()?;
-    if content.is_empty() {
-        None
-    } else {
-        Some(content.to_string())
+pub fn parse_ollama_line(line: &str) -> Result<Option<String>> {
+    let value: serde_json::Value = serde_json::from_str(line)
+        .with_context(|| format!("invalid Ollama stream JSON: {line}"))?;
+    if let Some(error) = value.get("error") {
+        anyhow::bail!("Ollama stream error: {}", format_ollama_stream_error(error));
     }
+    let content = value
+        .get("message")
+        .and_then(|message| message.get("content"))
+        .and_then(|content| content.as_str());
+    match content {
+        Some(content) if !content.is_empty() => Ok(Some(content.to_string())),
+        _ => Ok(None),
+    }
+}
+
+fn format_ollama_stream_error(error: &serde_json::Value) -> String {
+    error
+        .as_str()
+        .map(|message| message.to_string())
+        .unwrap_or_else(|| error.to_string())
 }
 
 fn format_ollama_error(status: reqwest::StatusCode, body: &str) -> String {
@@ -122,24 +137,38 @@ mod tests {
     fn parse_content_token() {
         let line =
             r#"{"model":"llama3","message":{"role":"assistant","content":"Hello"},"done":false}"#;
-        assert_eq!(parse_ollama_line(line), Some("Hello".to_string()));
+        assert_eq!(parse_ollama_line(line).unwrap(), Some("Hello".to_string()));
     }
 
     #[test]
     fn parse_empty_content_returns_none() {
         let line = r#"{"model":"llama3","message":{"role":"assistant","content":""},"done":true}"#;
-        assert_eq!(parse_ollama_line(line), None);
+        assert_eq!(parse_ollama_line(line).unwrap(), None);
     }
 
     #[test]
-    fn parse_invalid_json_returns_none() {
-        assert_eq!(parse_ollama_line("not json"), None);
+    fn parse_invalid_json_returns_error() {
+        let err = parse_ollama_line("not json").unwrap_err();
+        assert!(
+            err.to_string().contains("invalid Ollama stream JSON"),
+            "error should mention invalid stream JSON, got: {err}"
+        );
     }
 
     #[test]
     fn parse_missing_message_returns_none() {
         let line = r#"{"model":"llama3","done":true}"#;
-        assert_eq!(parse_ollama_line(line), None);
+        assert_eq!(parse_ollama_line(line).unwrap(), None);
+    }
+
+    #[test]
+    fn parse_error_payload_returns_error() {
+        let line = r#"{"error":"context length exceeded"}"#;
+        let err = parse_ollama_line(line).unwrap_err();
+        assert!(
+            err.to_string().contains("context length exceeded"),
+            "error should include provider message, got: {err}"
+        );
     }
 
     #[test]

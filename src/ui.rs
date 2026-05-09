@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Result, bail};
 use crossterm::event::{Event, KeyCode, KeyModifiers, read};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use futures::StreamExt;
@@ -150,14 +150,21 @@ pub fn print_unstaged_stat(stat: &str) {
 
 pub fn edit_message(message: &str) -> Result<String> {
     let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".into());
-    let (cmd, args) = split_editor_command(&editor);
+    edit_message_with_editor(&editor, message)
+}
+
+fn edit_message_with_editor(editor: &str, message: &str) -> Result<String> {
+    let (cmd, args) = split_editor_command(editor);
     let tmp = tempfile::NamedTempFile::new()?;
     std::fs::write(tmp.path(), message)?;
 
-    std::process::Command::new(cmd)
+    let status = std::process::Command::new(cmd)
         .args(args)
         .arg(tmp.path())
         .status()?;
+    if !status.success() {
+        bail!("editor exited with status: {status}");
+    }
 
     let content = std::fs::read_to_string(tmp.path())?;
     Ok(content.trim().to_string())
@@ -172,13 +179,22 @@ fn split_editor_command(editor: &str) -> (String, Vec<String>) {
 
 #[cfg(test)]
 mod tests {
-    use super::split_editor_command;
+    use super::{edit_message_with_editor, split_editor_command};
 
     #[test]
     fn split_editor_command_handles_args() {
         assert_eq!(
             split_editor_command("code --wait"),
             ("code".to_string(), vec!["--wait".to_string()])
+        );
+    }
+
+    #[test]
+    fn edit_message_with_editor_returns_error_when_editor_fails() {
+        let err = edit_message_with_editor("false", "message").unwrap_err();
+        assert!(
+            err.to_string().contains("editor exited with status"),
+            "Expected editor status error, got: {err}"
         );
     }
 }

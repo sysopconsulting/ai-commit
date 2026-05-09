@@ -3,7 +3,7 @@ use serde::Deserialize;
 use std::path::PathBuf;
 
 #[derive(Debug, Deserialize, Clone)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct Config {
     pub provider: String,
     pub model: String,
@@ -15,6 +15,18 @@ pub struct Config {
     pub language: String,
     pub diff_mode: String,
 }
+
+const CONFIG_KEYS: &[&str] = &[
+    "provider",
+    "model",
+    "api_url",
+    "api_key",
+    "max_input_tokens",
+    "emoji",
+    "one_line",
+    "language",
+    "diff_mode",
+];
 
 impl Default for Config {
     fn default() -> Self {
@@ -49,7 +61,7 @@ pub fn load_from_path(path: &PathBuf) -> Result<Config> {
     let content = std::fs::read_to_string(path)
         .with_context(|| format!("Failed to read config file: {}", path.display()))?;
     let cfg: Config = toml::from_str(&content)
-        .with_context(|| format!("Invalid TOML in config file: {}", path.display()))?;
+        .map_err(|e| anyhow::anyhow!("Invalid TOML in config file: {}: {e}", path.display()))?;
     validate(cfg)
 }
 
@@ -135,6 +147,10 @@ pub fn apply_env_override(cfg: &mut Config, key: &str, value: Option<&str>) {
 /// Creates parent directories if missing.
 /// Preserves types: bool for "true"/"false", integer for numeric strings, string otherwise.
 pub fn set_value(path: &PathBuf, key: &str, value: &str) -> Result<()> {
+    if !CONFIG_KEYS.contains(&key) {
+        anyhow::bail!("unknown config key: {key}");
+    }
+
     // Create parent dirs if needed
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
@@ -429,6 +445,31 @@ emoji = true
         assert!(
             err.to_string().contains("unknown diff_mode"),
             "Expected diff_mode validation error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_set_value_rejects_unknown_key() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("config.toml");
+
+        let err = set_value(&path, "modle", "gpt-4o").unwrap_err();
+        assert!(
+            err.to_string().contains("unknown config key"),
+            "Expected unknown key validation error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_load_rejects_unknown_key() {
+        let mut f = NamedTempFile::new().unwrap();
+        writeln!(f, r#"modle = "gpt-4o""#).unwrap();
+
+        let err = load_from_path(&f.path().to_path_buf()).unwrap_err();
+        assert!(
+            err.to_string().contains("unknown field")
+                || err.to_string().contains("unknown config key"),
+            "Expected unknown key validation error, got: {err}"
         );
     }
 }

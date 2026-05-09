@@ -3,11 +3,16 @@ use crate::config::Config;
 /// Builds the system prompt sent to the LLM.
 /// Token-efficient, no few-shot examples.
 pub fn build_system_prompt(config: &Config, scope: Option<&str>) -> String {
+    let format_rule = if scope.is_some() {
+        "- Format: <type>(<scope>): <subject>"
+    } else {
+        "- Format: <type>: <subject>"
+    };
     let mut lines = vec![
         "You are a git commit message generator. Output ONLY the commit message — no explanation, no preamble, no surrounding text.".to_string(),
         String::new(),
         "Rules:".to_string(),
-        "- Format: <type>(<scope>): <subject>".to_string(),
+        format_rule.to_string(),
         "- Types: fix, feat, refactor, docs, test, chore, style, perf, build, ci".to_string(),
         "- Subject: imperative, lowercase, no period, max 72 chars".to_string(),
         "- One line unless the changes are complex enough to warrant a body".to_string(),
@@ -98,6 +103,10 @@ fn is_commit_line(line: &str) -> bool {
         .any(|t| lower.starts_with(&format!("{t}:")) || lower.starts_with(&format!("{t}(")))
 }
 
+pub fn is_conventional_commit_message(message: &str) -> bool {
+    message.lines().next().map(is_commit_line).unwrap_or(false)
+}
+
 fn is_commentary(line: &str) -> bool {
     let trimmed = line.trim();
     let lower = trimmed.to_lowercase();
@@ -156,6 +165,24 @@ mod tests {
         assert!(
             !prompt.contains("Detected scope:"),
             "Prompt should not contain 'Detected scope:' when scope is None"
+        );
+        assert!(
+            prompt.contains("- Format: <type>: <subject>"),
+            "Prompt should allow unscoped conventional commits when scope is None: {prompt}"
+        );
+        assert!(
+            !prompt.contains("<type>(<scope>): <subject>"),
+            "Prompt should not require a scope when none was detected: {prompt}"
+        );
+    }
+
+    #[test]
+    fn prompt_uses_scoped_format_when_scope_is_detected() {
+        let config = Config::default();
+        let prompt = build_system_prompt(&config, Some("auth"));
+        assert!(
+            prompt.contains("- Format: <type>(<scope>): <subject>"),
+            "Prompt should prefer scoped format when scope is detected: {prompt}"
         );
     }
 

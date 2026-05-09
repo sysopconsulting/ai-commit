@@ -57,11 +57,24 @@ mod cli_tests {
     }
 
     #[test]
+    fn hook_flow_does_not_offer_to_stage_unstaged_changes() {
+        assert!(!should_offer_stage_when_no_staged(true));
+        assert!(should_offer_stage_when_no_staged(false));
+    }
+
+    #[test]
     fn unchanged_streamed_message_is_not_printed_again() {
         assert!(!should_print_cleaned_message(
             "feat(.): ignore target and .codex files\n",
             "feat(.): ignore target and .codex files"
         ));
+    }
+
+    #[test]
+    fn generated_message_must_be_non_empty_conventional_commit() {
+        assert!(validate_generated_message("").is_err());
+        assert!(validate_generated_message("update the readme").is_err());
+        assert!(validate_generated_message("fix: handle empty provider output").is_ok());
     }
 }
 
@@ -111,8 +124,24 @@ fn should_show_diff_before_generation(yes: bool, dry_run: bool, hook: bool) -> b
     !yes && !dry_run && !hook
 }
 
+fn should_offer_stage_when_no_staged(hook: bool) -> bool {
+    !hook
+}
+
 fn should_print_cleaned_message(raw_message: &str, cleaned_message: &str) -> bool {
     cleaned_message != raw_message.trim()
+}
+
+fn validate_generated_message(message: &str) -> Result<()> {
+    let message = message.trim();
+    if message.is_empty() {
+        anyhow::bail!("provider returned an empty commit message");
+    }
+    if !prompt::is_conventional_commit_message(message) {
+        let first_line = message.lines().next().unwrap_or_default();
+        anyhow::bail!("provider returned a non-conventional commit message: {first_line}");
+    }
+    Ok(())
 }
 
 async fn generate(cli: &Cli) -> Result<()> {
@@ -122,7 +151,11 @@ async fn generate(cli: &Cli) -> Result<()> {
     // If nothing staged, offer to stage all changes
     let files = match git::staged_files(&repo) {
         Ok(f) => f,
-        Err(_) if git::has_unstaged_changes(&repo) => {
+        Err(_) if cli.hook.is_some() => return Ok(()),
+        Err(_)
+            if should_offer_stage_when_no_staged(cli.hook.is_some())
+                && git::has_unstaged_changes(&repo) =>
+        {
             eprintln!("  No staged changes, but unstaged changes detected.");
             if let Ok(stat) = git::unstaged_stat(&repo) {
                 ui::print_unstaged_stat(&stat);
@@ -197,6 +230,7 @@ async fn generate(cli: &Cli) -> Result<()> {
 
         let raw_message = ui::stream_message(&mut stream).await?;
         let message = prompt::clean_message(&raw_message);
+        validate_generated_message(&message)?;
 
         // Show cleaned message if it differs from raw (preamble was stripped)
         if should_print_cleaned_message(&raw_message, &message) {

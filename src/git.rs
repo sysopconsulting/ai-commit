@@ -19,6 +19,21 @@ fn git_in(dir: &Path, args: &[&str]) -> Result<String> {
     }
 }
 
+fn git_in_raw(dir: &Path, args: &[&str]) -> Result<Vec<u8>> {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .with_context(|| format!("Failed to run: git {}", args.join(" ")))?;
+
+    if output.status.success() {
+        Ok(output.stdout)
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        bail!("git {}: {}", args.join(" "), stderr)
+    }
+}
+
 /// Returns the list of staged files. Errors if no files are staged.
 pub fn staged_files(repo: &Path) -> Result<Vec<String>> {
     let output = git_in(repo, &["diff", "--cached", "--name-only"])?;
@@ -72,16 +87,29 @@ pub fn staged_diff_for_files(
 /// Returns per-file numstat for staged changes: `(insertions, deletions, filename)`.
 /// Binary files report `0, 0` (their numstat is `-`).
 pub fn staged_numstat(repo: &Path) -> Result<Vec<(usize, usize, String)>> {
-    let output = git_in(repo, &["diff", "--cached", "--numstat"])?;
+    let output = git_in_raw(repo, &["diff", "--cached", "--numstat", "-z"])?;
+    let output = String::from_utf8_lossy(&output);
     let mut entries = Vec::new();
-    for line in output.lines() {
-        let parts: Vec<&str> = line.splitn(3, '\t').collect();
+    let mut fields = output.split_terminator('\0');
+
+    while let Some(record) = fields.next() {
+        let parts: Vec<&str> = record.splitn(3, '\t').collect();
         if parts.len() < 3 {
             continue;
         }
+
         let added: usize = parts[0].parse().unwrap_or(0);
         let removed: usize = parts[1].parse().unwrap_or(0);
-        entries.push((added, removed, parts[2].to_string()));
+        let path = if parts[2].is_empty() {
+            let _old_path = fields.next();
+            fields.next().unwrap_or_default()
+        } else {
+            parts[2]
+        };
+
+        if !path.is_empty() {
+            entries.push((added, removed, path.to_string()));
+        }
     }
     Ok(entries)
 }
@@ -472,7 +500,10 @@ mod tests {
             .unwrap();
 
         let ranked = staged_files_ranked(path).unwrap();
-        assert_eq!(ranked, vec!["z_big.txt".to_string(), "a_small.txt".to_string()]);
+        assert_eq!(
+            ranked,
+            vec!["z_big.txt".to_string(), "a_small.txt".to_string()]
+        );
     }
 
     #[test]
@@ -500,6 +531,43 @@ mod tests {
         assert!(
             zulu_pos < alpha_pos,
             "diff should respect requested file order, got:\n{diff}"
+        );
+    }
+
+    #[test]
+    fn staged_files_ranked_uses_postimage_path_for_renames() {
+        let repo = init_repo();
+        let path = repo.path();
+
+        fs::write(path.join("old.txt"), "line one\nline two\n").unwrap();
+        Command::new("git")
+            .args(["add", "old.txt"])
+            .current_dir(path)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "add old file"])
+            .current_dir(path)
+            .env("GIT_AUTHOR_NAME", "Test User")
+            .env("GIT_AUTHOR_EMAIL", "test@example.com")
+            .env("GIT_COMMITTER_NAME", "Test User")
+            .env("GIT_COMMITTER_EMAIL", "test@example.com")
+            .output()
+            .unwrap();
+
+        Command::new("git")
+            .args(["mv", "old.txt", "new.txt"])
+            .current_dir(path)
+            .output()
+            .unwrap();
+
+        let ranked = staged_files_ranked(path).unwrap();
+        assert_eq!(ranked, vec!["new.txt".to_string()]);
+
+        let diff = staged_diff_for_files(path, None, &ranked).unwrap();
+        assert!(
+            diff.contains("rename to new.txt") || diff.contains("diff --git"),
+            "ranked rename path should produce a staged diff, got:\n{diff}"
         );
     }
 

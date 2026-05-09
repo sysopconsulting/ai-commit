@@ -69,8 +69,10 @@ impl OpenAiProvider {
             loop {
                 match lines.next_line().await {
                     Ok(Some(line)) => {
-                        if let Some(token) = parse_openai_line(&line) {
-                            return Some((Ok(token), lines));
+                        match parse_openai_line(&line) {
+                            Ok(Some(token)) => return Some((Ok(token), lines)),
+                            Ok(None) => {}
+                            Err(e) => return Some((Err(e), lines)),
                         }
                         // Empty content or non-data line — skip and continue
                     }
@@ -89,23 +91,36 @@ impl OpenAiProvider {
 /// Parse a single SSE line from OpenAI's streaming response.
 /// Lines are prefixed with "data: ".
 /// Returns the content token if present and non-empty, otherwise None.
-pub fn parse_openai_line(line: &str) -> Option<String> {
-    let json_str = line.strip_prefix("data: ")?;
+pub fn parse_openai_line(line: &str) -> Result<Option<String>> {
+    let Some(json_str) = line.strip_prefix("data: ") else {
+        return Ok(None);
+    };
     if json_str == "[DONE]" {
-        return None;
+        return Ok(None);
     }
-    let value: serde_json::Value = serde_json::from_str(json_str).ok()?;
+    let value: serde_json::Value = serde_json::from_str(json_str)
+        .with_context(|| format!("invalid OpenAI stream JSON: {json_str}"))?;
+    if let Some(error) = value.get("error") {
+        anyhow::bail!("OpenAI stream error: {}", format_openai_error(error));
+    }
     let content = value
-        .get("choices")?
-        .get(0)?
-        .get("delta")?
-        .get("content")?
-        .as_str()?;
-    if content.is_empty() {
-        None
-    } else {
-        Some(content.to_string())
+        .get("choices")
+        .and_then(|choices| choices.get(0))
+        .and_then(|choice| choice.get("delta"))
+        .and_then(|delta| delta.get("content"))
+        .and_then(|content| content.as_str());
+    match content {
+        Some(content) if !content.is_empty() => Ok(Some(content.to_string())),
+        _ => Ok(None),
     }
+}
+
+fn format_openai_error(error: &serde_json::Value) -> String {
+    error
+        .get("message")
+        .and_then(|message| message.as_str())
+        .map(|message| message.to_string())
+        .unwrap_or_else(|| error.to_string())
 }
 
 #[cfg(test)]
@@ -115,33 +130,43 @@ mod tests {
     #[test]
     fn parse_content_token() {
         let line = r#"data: {"id":"x","object":"chat.completion.chunk","choices":[{"delta":{"content":"Hello"},"index":0}]}"#;
-        assert_eq!(parse_openai_line(line), Some("Hello".to_string()));
+        assert_eq!(parse_openai_line(line).unwrap(), Some("Hello".to_string()));
     }
 
     #[test]
     fn parse_done_returns_none() {
-        assert_eq!(parse_openai_line("data: [DONE]"), None);
+        assert_eq!(parse_openai_line("data: [DONE]").unwrap(), None);
     }
 
     #[test]
     fn parse_empty_line_returns_none() {
-        assert_eq!(parse_openai_line(""), None);
+        assert_eq!(parse_openai_line("").unwrap(), None);
     }
 
     #[test]
     fn parse_no_data_prefix_returns_none() {
-        assert_eq!(parse_openai_line("event: message"), None);
+        assert_eq!(parse_openai_line("event: message").unwrap(), None);
     }
 
     #[test]
     fn parse_delta_without_content_returns_none() {
         let line = r#"data: {"id":"x","choices":[{"delta":{"role":"assistant"},"index":0}]}"#;
-        assert_eq!(parse_openai_line(line), None);
+        assert_eq!(parse_openai_line(line).unwrap(), None);
     }
 
     #[test]
     fn parse_empty_content_returns_none() {
         let line = r#"data: {"id":"x","choices":[{"delta":{"content":""},"index":0}]}"#;
-        assert_eq!(parse_openai_line(line), None);
+        assert_eq!(parse_openai_line(line).unwrap(), None);
+    }
+
+    #[test]
+    fn parse_error_payload_returns_error() {
+        let line = r#"data: {"error":{"message":"context length exceeded"}}"#;
+        let err = parse_openai_line(line).unwrap_err();
+        assert!(
+            err.to_string().contains("context length exceeded"),
+            "error should include provider message, got: {err}"
+        );
     }
 }
