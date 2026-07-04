@@ -187,7 +187,7 @@ async fn generate(cli: &Cli) -> Result<()> {
 
     let mut current_diff = initial_diff;
     let mut current_mode = initial_mode;
-    let mut retries: u32 = 0;
+    let show_thinking = !cli.yes && !cli.dry_run && cli.hook.is_none();
 
     loop {
         let mut user_content = current_diff.clone();
@@ -215,25 +215,28 @@ async fn generate(cli: &Cli) -> Result<()> {
                     || msg.contains("too long")
                     || msg.contains("maximum")
                     || msg.contains("token");
+                // The mode ladder is finite (full → compact → budgeted →
+                // stat → None) and get_forced_diff returns the mode it
+                // ACTUALLY produced, so this always terminates.
                 if is_context_error
-                    && retries < 2
                     && let Some(smaller_mode) = diff::next_smaller_mode(current_mode)
                 {
-                    current_diff = diff::get_forced_diff(&repo, smaller_mode)?;
-                    current_mode = smaller_mode;
-                    retries += 1;
+                    let (smaller_diff, actual_mode) =
+                        diff::get_forced_diff(&repo, smaller_mode, cfg.max_input_tokens)?;
+                    current_diff = smaller_diff;
+                    current_mode = actual_mode;
                     continue;
                 }
                 return Err(e);
             }
         };
 
-        let raw_message = ui::stream_message(&mut stream).await?;
-        let message = prompt::clean_message(&raw_message);
+        let streamed = ui::stream_message(&mut stream, show_thinking).await?;
+        let message = prompt::clean_message(&streamed.raw);
         validate_generated_message(&message)?;
 
-        // Show cleaned message if it differs from raw (preamble was stripped)
-        if should_print_cleaned_message(&raw_message, &message) {
+        // Reprint only when cleaning changed what the user actually saw
+        if should_print_cleaned_message(&streamed.displayed, &message) {
             eprintln!("\n  (cleaned)\n{message}");
         }
 

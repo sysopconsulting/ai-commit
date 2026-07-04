@@ -9,29 +9,35 @@ pub fn build_system_prompt(config: &Config, scope: Option<&str>) -> String {
         "- Format: <type>: <subject>"
     };
     let mut lines = vec![
-        "You are a git commit message generator. Output ONLY the commit message — no explanation, no preamble, no surrounding text.".to_string(),
+        "You are a git commit message generator. Output ONLY the raw commit message — no explanation, no preamble, no markdown fences.".to_string(),
         String::new(),
         "Rules:".to_string(),
         format_rule.to_string(),
         "- Types: fix, feat, refactor, docs, test, chore, style, perf, build, ci".to_string(),
-        "- Subject: imperative, lowercase, no period, max 72 chars".to_string(),
-        "- Capture the essence of the change, not just the largest file or most obvious edit"
-            .to_string(),
-        "- Output the raw commit message only — do NOT wrap in backticks or markdown".to_string(),
+        "- Pick the type of the primary change — the reason this commit exists; feat or fix outweighs accompanying refactor/test/docs/chore work".to_string(),
+        "- Subject: imperative, lowercase, no period, max 72 chars, naming the primary change concretely".to_string(),
+        "- Never write vague subjects like \"update code\", \"improve handling\", \"various changes\"".to_string(),
+        "- Describe only what the diff and file list show — never invent changes".to_string(),
     ];
 
     if config.one_line {
         lines.push("- Output only a single-line commit message, no body".to_string());
     } else {
         lines.push(
-            "- For non-trivial commits, add a blank line followed by 2-4 short body lines that summarize why the change matters and the key behavior touched"
+            "- Body: when the commit contains several distinct changes, add a blank line then 2-6 \"- \" bullets, one per logical change, most important first, each under 72 chars, naming modules and behavior rather than filenames"
                 .to_string(),
         );
-        lines.push(
-            "- Keep simple docs/style/chore changes as one line when a body would repeat the subject"
-                .to_string(),
-        );
+        lines.push("- Omit the body when it would only restate the subject".to_string());
     }
+
+    lines.push(
+        "- Input may start with a \"Files changed\" list ranked by relevance; hunks may be truncated or omitted — use the list to cover all significant changes"
+            .to_string(),
+    );
+    lines.push(
+        "- Files marked (low-signal) are lockfiles or generated output; mention them only if nothing else changed"
+            .to_string(),
+    );
 
     if config.emoji {
         lines.push("- Prefix the subject with a relevant emoji".to_string());
@@ -59,11 +65,156 @@ const TYPES: &[&str] = &[
     "fix", "feat", "refactor", "docs", "test", "chore", "style", "perf", "build", "ci",
 ];
 
-/// Clean LLM output: strip preamble, code fences, trailing commentary.
-/// Finds the first line that looks like a conventional commit and returns
-/// from there, discarding any surrounding prose the model may have added.
+/// If `s` begins with a `<think>`/`<thinking>` open or close tag
+/// (case-insensitive, attributes tolerated), return `(tag_len, is_closing)`.
+/// Shared by [`clean_message`] and the streaming display filter so both use
+/// the identical tag grammar.
+pub(crate) fn think_tag_at(s: &str) -> Option<(usize, bool)> {
+    let bytes = s.as_bytes();
+    if bytes.first() != Some(&b'<') {
+        return None;
+    }
+    let mut i = 1;
+    let closing = bytes.get(i) == Some(&b'/');
+    if closing {
+        i += 1;
+    }
+    const FULL: &[u8] = b"thinking";
+    const SHORT: &[u8] = b"think";
+    let name_len = if bytes.len() >= i + FULL.len()
+        && bytes[i..i + FULL.len()].eq_ignore_ascii_case(FULL)
+    {
+        FULL.len()
+    } else if bytes.len() >= i + SHORT.len() && bytes[i..i + SHORT.len()].eq_ignore_ascii_case(SHORT)
+    {
+        SHORT.len()
+    } else {
+        return None;
+    };
+    i += name_len;
+    match bytes.get(i) {
+        Some(&b'>') => Some((i + 1, closing)),
+        Some(c) if c.is_ascii_whitespace() => {
+            let rest = &s[i..];
+            let gt = rest.find('>')?;
+            if rest[..gt].contains('<') {
+                return None;
+            }
+            Some((i + gt + 1, closing))
+        }
+        _ => None,
+    }
+}
+
+/// True if `s` (starting with `<` and containing no `>`) could still grow
+/// into a think tag once more streamed bytes arrive.
+pub(crate) fn could_be_think_tag_prefix(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    if bytes.first() != Some(&b'<') || s.contains('>') {
+        return false;
+    }
+    let mut rest = &bytes[1..];
+    if rest.first() == Some(&b'/') {
+        rest = &rest[1..];
+    }
+    const SHORT: &[u8] = b"think";
+    const ING: &[u8] = b"ing";
+    let head_len = rest.len().min(SHORT.len());
+    if !rest[..head_len].eq_ignore_ascii_case(&SHORT[..head_len]) {
+        return false;
+    }
+    if rest.len() <= SHORT.len() {
+        return true;
+    }
+    let tail = &rest[SHORT.len()..];
+    if tail[0].is_ascii_whitespace() {
+        return true;
+    }
+    let ing_len = tail.len().min(ING.len());
+    if !tail[..ing_len].eq_ignore_ascii_case(&ING[..ing_len]) {
+        return false;
+    }
+    if tail.len() <= ING.len() {
+        return true;
+    }
+    tail[ING.len()].is_ascii_whitespace()
+}
+
+/// Remove `<think>...</think>` reasoning spans (reasoning models like qwen3
+/// and deepseek-r1 emit them).
+///
+/// * Closed blocks are removed wherever they appear.
+/// * A stray closing tag (opener lost) keeps only text after the LAST closer.
+/// * An unclosed opener drops everything from the opener onward — and if
+///   nothing precedes it, everything is reasoning by construction, so the
+///   result is empty (rejected later by validation rather than risking a
+///   commit built from reasoning prose).
+fn strip_think_blocks(text: &str) -> String {
+    let mut tags: Vec<(usize, usize, bool)> = Vec::new();
+    let mut i = 0;
+    while let Some(off) = text[i..].find('<') {
+        let pos = i + off;
+        if let Some((len, closing)) = think_tag_at(&text[pos..]) {
+            tags.push((pos, pos + len, closing));
+            i = pos + len;
+        } else {
+            i = pos + 1;
+        }
+    }
+    if tags.is_empty() {
+        return text.to_string();
+    }
+
+    let mut result = String::new();
+    let mut cursor = 0;
+    let mut depth = 0usize;
+    for (start, end, closing) in tags {
+        if closing {
+            if depth > 0 {
+                depth -= 1;
+                if depth == 0 {
+                    cursor = end;
+                }
+            } else {
+                // Stray closer: everything before it was reasoning.
+                result.clear();
+                cursor = end;
+            }
+        } else {
+            if depth == 0 {
+                result.push_str(&text[cursor..start]);
+            }
+            depth += 1;
+        }
+    }
+    if depth > 0 {
+        // Unclosed opener: drop from the opener to the end.
+        if result.trim().is_empty() {
+            return String::new();
+        }
+        return result;
+    }
+    result.push_str(&text[cursor..]);
+    result
+}
+
+/// Strip one pair of matching quotes wrapping the whole message.
+fn strip_wrapping_quotes(s: &str) -> &str {
+    for q in ['"', '\''] {
+        if s.len() >= 2 && s.starts_with(q) && s.ends_with(q) {
+            return s[1..s.len() - 1].trim();
+        }
+    }
+    s
+}
+
+/// Clean LLM output: strip reasoning blocks, wrapping quotes, code fences,
+/// preamble, and trailing commentary. Finds the first line that looks like a
+/// conventional commit and returns from there, discarding any surrounding
+/// prose the model may have added.
 pub fn clean_message(raw: &str) -> String {
-    let raw = raw.trim();
+    let without_think = strip_think_blocks(raw.trim());
+    let raw = strip_wrapping_quotes(without_think.trim());
 
     // Strip markdown code fences if the whole message is wrapped
     let unwrapped = if raw.starts_with("```") {
@@ -84,6 +235,11 @@ pub fn clean_message(raw: &str) -> String {
         // Take from the commit line onwards
         let mut result: Vec<&str> = Vec::new();
         for &line in &lines[start..] {
+            // Drop stray fence lines (a fence opened before the preamble
+            // was stripped leaves its closing ``` behind)
+            if line.trim().starts_with("```") {
+                continue;
+            }
             // Stop at trailing commentary (blank line followed by non-commit prose)
             if !result.is_empty() && line.is_empty() {
                 // Check if what follows is a body or trailing commentary
@@ -157,16 +313,38 @@ mod tests {
     }
 
     #[test]
-    fn default_prompt_requests_balanced_body_for_non_trivial_commits() {
+    fn default_prompt_targets_primary_change_with_bullet_body() {
         let config = Config::default();
         let prompt = build_system_prompt(&config, None);
         assert!(
-            prompt.contains("Capture the essence"),
-            "Prompt should ask for intent-rich messages: {prompt}"
+            prompt.contains("primary change"),
+            "Prompt should anchor type and subject on the primary change: {prompt}"
         );
         assert!(
-            prompt.contains("2-4 short body lines"),
-            "Prompt should request a compact body for non-trivial commits: {prompt}"
+            prompt.contains("2-6 \"- \" bullets"),
+            "Prompt should request bullet body for multi-concern commits: {prompt}"
+        );
+        assert!(
+            prompt.contains("vague subjects"),
+            "Prompt should ban vague subjects: {prompt}"
+        );
+        assert!(
+            prompt.contains("never invent changes"),
+            "Prompt should forbid inventing changes: {prompt}"
+        );
+    }
+
+    #[test]
+    fn default_prompt_explains_truncated_input_and_low_signal() {
+        let config = Config::default();
+        let prompt = build_system_prompt(&config, None);
+        assert!(
+            prompt.contains("truncated or omitted"),
+            "Prompt should explain possibly-partial hunks: {prompt}"
+        );
+        assert!(
+            prompt.contains("(low-signal)"),
+            "Prompt should explain low-signal markers: {prompt}"
         );
     }
 
@@ -264,7 +442,7 @@ mod tests {
             "should mention single-line: {prompt}"
         );
         assert!(
-            !prompt.contains("2-4 short body lines"),
+            !prompt.contains("bullets"),
             "one_line should not include body guidance: {prompt}"
         );
     }
@@ -275,6 +453,16 @@ mod tests {
         let config = Config::default();
         let prompt = build_system_prompt(&config, None);
         assert!(!prompt.is_empty(), "Prompt should not be empty");
+    }
+
+    #[test]
+    fn prompt_stays_token_light() {
+        let config = Config::default();
+        let prompt = build_system_prompt(&config, Some("auth"));
+        assert!(
+            crate::token::estimate_tokens(&prompt) < 500,
+            "System prompt must stay well under 500 tokens; it competes with the diff budget"
+        );
     }
 
     // --- clean_message tests ---
@@ -334,5 +522,83 @@ mod tests {
             clean_message(raw),
             "fix: resolve null pointer on empty input"
         );
+    }
+
+    // --- think-block stripping ---
+
+    #[test]
+    fn clean_strips_closed_think_block() {
+        let raw = "<think>\nThe diff adds an endpoint. Maybe feat: something else?\n</think>\n\nfeat(auth): add login endpoint";
+        assert_eq!(clean_message(raw), "feat(auth): add login endpoint");
+    }
+
+    #[test]
+    fn clean_strips_multiple_think_blocks() {
+        let raw = "<think>first</think>fix: handle empty input<think>second</think>";
+        assert_eq!(clean_message(raw), "fix: handle empty input");
+    }
+
+    #[test]
+    fn clean_strips_uppercase_thinking_block() {
+        let raw = "<THINKING>reasoning here</THINKING>\nchore: bump dependencies";
+        assert_eq!(clean_message(raw), "chore: bump dependencies");
+    }
+
+    #[test]
+    fn clean_unclosed_leading_think_returns_empty() {
+        // A commit-looking line INSIDE unclosed reasoning must not be
+        // extracted — everything after an unclosed leading opener is
+        // reasoning by construction.
+        let raw = "<think>\nmaybe this could be\nfix: adjust parser\nbecause the hunks show...";
+        assert_eq!(clean_message(raw), "");
+    }
+
+    #[test]
+    fn clean_unclosed_think_after_message_keeps_message() {
+        let raw = "fix: adjust parser\n<think>leftover reasoning that never closes";
+        assert_eq!(clean_message(raw), "fix: adjust parser");
+    }
+
+    #[test]
+    fn clean_stray_closer_keeps_text_after_last() {
+        let raw = "streamed-away reasoning tail</think>\nfeat: add retry ladder";
+        assert_eq!(clean_message(raw), "feat: add retry ladder");
+    }
+
+    #[test]
+    fn clean_strips_wrapping_quotes() {
+        assert_eq!(clean_message("\"feat: add x\""), "feat: add x");
+        assert_eq!(clean_message("'fix: repair y'"), "fix: repair y");
+    }
+
+    #[test]
+    fn clean_think_fence_and_preamble_combined() {
+        let raw = "<think>hmm</think>\nHere is the message:\n```\nfeat(api): add rate limiting\n```";
+        assert_eq!(clean_message(raw), "feat(api): add rate limiting");
+    }
+
+    // --- tag matcher ---
+
+    #[test]
+    fn think_tag_matcher_accepts_variants() {
+        assert_eq!(think_tag_at("<think>"), Some((7, false)));
+        assert_eq!(think_tag_at("</think>"), Some((8, true)));
+        assert_eq!(think_tag_at("<THINKING>"), Some((10, false)));
+        assert_eq!(think_tag_at("<think type=\"x\">rest"), Some((16, false)));
+        assert_eq!(think_tag_at("<thinks>"), None);
+        assert_eq!(think_tag_at("<thought>"), None);
+        assert_eq!(think_tag_at("plain text"), None);
+    }
+
+    #[test]
+    fn think_tag_prefix_detection() {
+        assert!(could_be_think_tag_prefix("<"));
+        assert!(could_be_think_tag_prefix("<th"));
+        assert!(could_be_think_tag_prefix("</thin"));
+        assert!(could_be_think_tag_prefix("<thinkin"));
+        assert!(could_be_think_tag_prefix("<think attr=\"unfinished"));
+        assert!(!could_be_think_tag_prefix("<div"));
+        assert!(!could_be_think_tag_prefix("<thinkx"));
+        assert!(!could_be_think_tag_prefix("<think>")); // complete, not a prefix
     }
 }

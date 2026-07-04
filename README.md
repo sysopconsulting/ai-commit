@@ -209,7 +209,7 @@ api_key = "sk-..."
 | `emoji` | `false` | Ask for an emoji in the subject |
 | `one_line` | `false` | Force a single-line message |
 | `language` | `en` | Language hint for the message |
-| `diff_mode` | `auto` | `auto`, `full`, `compact`, or `stat` |
+| `diff_mode` | `auto` | `auto`, `full`, `compact`, `budgeted`, or `stat` |
 
 Invalid `provider`, `diff_mode`, and zero token budgets are rejected when config
 is loaded or changed.
@@ -271,22 +271,40 @@ full diff
   ↓ too large
 compact diff with --unified=0
   ↓ too large
-stat only
-  ↓ too large
+budgeted: per-file slices of the compact diff
+  ↓ not viable
 truncated stat
 ```
+
+The budgeted stage is built for large multi-file changesets (for example
+agent-generated commits). Instead of dropping straight to a filename list, it
+divides the token budget across changed files so every important file keeps at
+least part of its hunks. Truncated files are marked `... [hunks truncated]`
+and fully dropped files are counted in a trailing
+`[hunks omitted for N of M files]` line, so the model knows what it is not
+seeing.
+
+Files are ranked by relevance: files with more changed lines come first, and
+low-signal files — lockfiles such as `Cargo.lock` or `package-lock.json`,
+minified assets, source maps, and `vendor/`/`node_modules/` content — are
+demoted to the end and marked `(low-signal)` in the file list, so a huge
+lockfile can no longer crowd out the actual change.
 
 You can force a mode:
 
 ```bash
 acm config set diff_mode=full
 acm config set diff_mode=compact
+acm config set diff_mode=budgeted
 acm config set diff_mode=stat
 acm config set diff_mode=auto
 ```
 
-If the provider still rejects the prompt for context length, `acm` retries with
-the next smaller diff mode up to two times.
+Forcing `budgeted` when the budget cannot fit any hunks (for example a very
+small `max_input_tokens` with many files) falls back to a truncated stat.
+
+If the provider still rejects the prompt for context length, `acm` retries
+down the ladder until it reaches stat.
 
 ## Scope Detection
 
@@ -305,12 +323,15 @@ Common top-level prefixes such as `src`, `pkg`, `apps`, `lib`, `libs`, and
 
 Models sometimes add prose around the answer. `acm` cleans common cases:
 
-- Markdown fences
+- `<think>...</think>` reasoning blocks from reasoning models (qwen3,
+  deepseek-r1); these are also hidden live during streaming, replaced by a
+  one-time `(thinking…)` note
+- Markdown fences and wrapping quotes
 - "Here is a commit message" preambles
 - Trailing explanatory notes
 
-If cleanup changes the streamed output, `acm` prints the cleaned message before
-continuing.
+If cleanup changes what was displayed during streaming, `acm` prints the
+cleaned message before continuing.
 
 ## Troubleshooting
 
@@ -320,7 +341,7 @@ continuing.
 | `model ... not found` | Run `ollama pull <model>` or set another model |
 | `ACM_API_KEY not set` | Set `api_key` or `ACM_API_KEY` for `openai` |
 | No staged files | Run `git add`, or accept auto-staging |
-| Provider rejects context | Use `diff_mode=compact` or `diff_mode=stat` |
+| Provider rejects context | Lower `max_input_tokens`, or use `diff_mode=budgeted` / `diff_mode=stat` |
 | Editor does not open | Set `$EDITOR`, for example `export EDITOR="vim"` |
 | Hook does not install | Check for an existing non-`acm` hook |
 

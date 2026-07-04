@@ -41,22 +41,122 @@ pub fn print_summary(files: usize, insertions: usize, deletions: usize) {
     }
 }
 
-pub async fn stream_message(stream: &mut TokenStream) -> Result<String> {
-    let mut full = String::new();
+/// A streamed provider response: `raw` is everything the model sent,
+/// `displayed` is what the user actually saw (reasoning spans filtered).
+pub struct StreamedMessage {
+    pub raw: String,
+    pub displayed: String,
+}
+
+/// Stateful display filter that suppresses `<think>...</think>` spans in a
+/// token stream. Tags split across chunk boundaries are held in `pending`
+/// until enough bytes arrive to decide.
+struct ThinkFilter {
+    depth: usize,
+    placeholder_emitted: bool,
+    pending: String,
+}
+
+/// A partial tag candidate longer than this is flushed as literal text.
+const MAX_PENDING_TAG: usize = 64;
+
+impl ThinkFilter {
+    fn new() -> Self {
+        Self {
+            depth: 0,
+            placeholder_emitted: false,
+            pending: String::new(),
+        }
+    }
+
+    /// Feed a chunk; returns (visible text, whether suppression just started
+    /// for the first time — the caller may show a placeholder).
+    fn push(&mut self, chunk: &str) -> (String, bool) {
+        let mut buf = std::mem::take(&mut self.pending);
+        buf.push_str(chunk);
+        let mut visible = String::new();
+        let mut placeholder = false;
+        let mut i = 0;
+
+        while i < buf.len() {
+            let Some(off) = buf[i..].find('<') else {
+                if self.depth == 0 {
+                    visible.push_str(&buf[i..]);
+                }
+                break;
+            };
+            let pos = i + off;
+            if self.depth == 0 {
+                visible.push_str(&buf[i..pos]);
+            }
+            if let Some((len, closing)) = crate::prompt::think_tag_at(&buf[pos..]) {
+                if closing {
+                    self.depth = self.depth.saturating_sub(1);
+                } else {
+                    if self.depth == 0 && !self.placeholder_emitted {
+                        placeholder = true;
+                        self.placeholder_emitted = true;
+                    }
+                    self.depth += 1;
+                }
+                i = pos + len;
+            } else if buf.len() - pos < MAX_PENDING_TAG
+                && crate::prompt::could_be_think_tag_prefix(&buf[pos..])
+            {
+                // Might be a tag split across chunks — hold and decide later.
+                self.pending = buf[pos..].to_string();
+                return (visible, placeholder);
+            } else {
+                if self.depth == 0 {
+                    visible.push('<');
+                }
+                i = pos + 1;
+            }
+        }
+        (visible, placeholder)
+    }
+
+    /// Stream ended: any held partial tag is literal text (unless we are
+    /// inside a think span, where it is reasoning).
+    fn flush(&mut self) -> String {
+        let pending = std::mem::take(&mut self.pending);
+        if self.depth == 0 { pending } else { String::new() }
+    }
+}
+
+pub async fn stream_message(
+    stream: &mut TokenStream,
+    show_thinking_placeholder: bool,
+) -> Result<StreamedMessage> {
+    let mut raw = String::new();
+    let mut displayed = String::new();
+    let mut filter = ThinkFilter::new();
     let stdout = io::stdout();
     let mut out = stdout.lock();
 
     while let Some(token) = stream.next().await {
         let token = token?;
-        out.write_all(token.as_bytes())?;
-        out.flush()?;
-        full.push_str(&token);
+        raw.push_str(&token);
+        let (visible, thinking_started) = filter.push(&token);
+        if thinking_started && show_thinking_placeholder {
+            eprintln!("  (thinking…)");
+        }
+        if !visible.is_empty() {
+            out.write_all(visible.as_bytes())?;
+            out.flush()?;
+            displayed.push_str(&visible);
+        }
+    }
+    let tail = filter.flush();
+    if !tail.is_empty() {
+        out.write_all(tail.as_bytes())?;
+        displayed.push_str(&tail);
     }
 
     writeln!(out)?;
     out.flush()?;
 
-    Ok(full)
+    Ok(StreamedMessage { raw, displayed })
 }
 
 pub fn prompt_action() -> Result<Action> {
@@ -179,7 +279,65 @@ fn split_editor_command(editor: &str) -> (String, Vec<String>) {
 
 #[cfg(test)]
 mod tests {
-    use super::{edit_message_with_editor, split_editor_command};
+    use super::{ThinkFilter, edit_message_with_editor, split_editor_command};
+
+    /// Feed chunks through a ThinkFilter and collect the displayed text and
+    /// whether a placeholder was requested.
+    fn run_filter(chunks: &[&str]) -> (String, bool) {
+        let mut filter = ThinkFilter::new();
+        let mut displayed = String::new();
+        let mut placeholder = false;
+        for chunk in chunks {
+            let (visible, p) = filter.push(chunk);
+            displayed.push_str(&visible);
+            placeholder |= p;
+        }
+        displayed.push_str(&filter.flush());
+        (displayed, placeholder)
+    }
+
+    #[test]
+    fn filter_passes_plain_text_through() {
+        let (out, placeholder) = run_filter(&["feat: add ", "login endpoint"]);
+        assert_eq!(out, "feat: add login endpoint");
+        assert!(!placeholder);
+    }
+
+    #[test]
+    fn filter_suppresses_think_span_and_requests_placeholder() {
+        let (out, placeholder) =
+            run_filter(&["<think>internal reasoning</think>", "fix: handle empty input"]);
+        assert_eq!(out, "fix: handle empty input");
+        assert!(placeholder);
+    }
+
+    #[test]
+    fn filter_handles_tag_split_across_chunks() {
+        let (out, placeholder) = run_filter(&[
+            "<th", "ink>reason", "ing</th", "ink>", "feat: add retry",
+        ]);
+        assert_eq!(out, "feat: add retry");
+        assert!(placeholder);
+    }
+
+    #[test]
+    fn filter_keeps_non_think_angle_brackets() {
+        let (out, _) = run_filter(&["feat: support <T> generics ", "<div> too"]);
+        assert_eq!(out, "feat: support <T> generics <div> too");
+    }
+
+    #[test]
+    fn filter_unclosed_think_suppresses_to_end() {
+        let (out, placeholder) = run_filter(&["<think>never closes ", "more reasoning"]);
+        assert_eq!(out, "");
+        assert!(placeholder);
+    }
+
+    #[test]
+    fn filter_flushes_trailing_partial_non_tag() {
+        let (out, _) = run_filter(&["fix: compare a ", "<themes"]);
+        assert_eq!(out, "fix: compare a <themes");
+    }
 
     #[test]
     fn split_editor_command_handles_args() {

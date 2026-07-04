@@ -114,30 +114,75 @@ pub fn staged_numstat(repo: &Path) -> Result<Vec<(usize, usize, String)>> {
     Ok(entries)
 }
 
-/// Returns staged file paths ordered by total lines changed (insertions+deletions), descending.
-/// Ties are broken alphabetically for stable output.
+/// True for files whose diff content is near-certain noise for commit-message
+/// purposes: lockfiles, minified assets, source maps, and vendored dependency
+/// directories. Matching is conservative — exact lockfile basenames, specific
+/// extensions, and `node_modules`/`vendor` as directory components only (a
+/// root-level file literally named `vendor` is not demoted).
+pub fn is_low_signal_path(path: &str) -> bool {
+    const LOCKFILES: &[&str] = &[
+        "Cargo.lock",
+        "package-lock.json",
+        "yarn.lock",
+        "pnpm-lock.yaml",
+        "bun.lockb",
+        "go.sum",
+        "composer.lock",
+        "Gemfile.lock",
+        "poetry.lock",
+        "uv.lock",
+    ];
+    let p = Path::new(path);
+    let Some(basename) = p.file_name().map(|n| n.to_string_lossy().into_owned()) else {
+        return false;
+    };
+    if LOCKFILES.contains(&basename.as_str()) {
+        return true;
+    }
+    let lower = basename.to_lowercase();
+    if lower.ends_with(".min.js") || lower.ends_with(".min.css") || lower.ends_with(".map") {
+        return true;
+    }
+    if let Some(parent) = p.parent() {
+        for component in parent.components() {
+            let c = component.as_os_str().to_string_lossy();
+            if c == "node_modules" || c == "vendor" {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Sort numstat entries by relevance: high-signal files first (by lines
+/// changed, descending), then low-signal files (same order). Ties break
+/// alphabetically for stable output.
+fn rank_entries(entries: &mut [(usize, usize, String)]) {
+    entries.sort_by(|a, b| {
+        let (la, lb) = (is_low_signal_path(&a.2), is_low_signal_path(&b.2));
+        la.cmp(&lb)
+            .then_with(|| (b.0 + b.1).cmp(&(a.0 + a.1)))
+            .then_with(|| a.2.cmp(&b.2))
+    });
+}
+
+/// Returns staged file paths ordered by relevance: high-signal files by lines
+/// changed (descending), then low-signal files (lockfiles, generated assets).
 pub fn staged_files_ranked(repo: &Path) -> Result<Vec<String>> {
     let mut entries = staged_numstat(repo)?;
-    entries.sort_by(|a, b| {
-        let ta = a.0 + a.1;
-        let tb = b.0 + b.1;
-        tb.cmp(&ta).then_with(|| a.2.cmp(&b.2))
-    });
+    rank_entries(&mut entries);
     Ok(entries.into_iter().map(|(_, _, f)| f).collect())
 }
 
-/// Custom stat header listing files ranked by lines changed (descending),
+/// Custom stat header listing files ranked by relevance (see [`rank_entries`]),
 /// followed by the standard "N files changed, X insertions(+), Y deletions(-)" summary.
+/// Low-signal files are marked so the model can discount them.
 pub fn staged_stat_ranked(repo: &Path) -> Result<String> {
     let mut entries = staged_numstat(repo)?;
     if entries.is_empty() {
         return Ok(String::new());
     }
-    entries.sort_by(|a, b| {
-        let ta = a.0 + a.1;
-        let tb = b.0 + b.1;
-        tb.cmp(&ta).then_with(|| a.2.cmp(&b.2))
-    });
+    rank_entries(&mut entries);
     let name_w = entries.iter().map(|(_, _, n)| n.len()).max().unwrap_or(0);
     let total_w = entries
         .iter()
@@ -148,8 +193,13 @@ pub fn staged_stat_ranked(repo: &Path) -> Result<String> {
     let (mut tot_ins, mut tot_del) = (0usize, 0usize);
     for (added, removed, name) in &entries {
         let total = added + removed;
+        let marker = if is_low_signal_path(name) {
+            " (low-signal)"
+        } else {
+            ""
+        };
         out.push_str(&format!(
-            " {name:<name_w$} | {total:>total_w$}  (+{added} -{removed})\n",
+            " {name:<name_w$} | {total:>total_w$}  (+{added} -{removed}){marker}\n",
         ));
         tot_ins += added;
         tot_del += removed;
@@ -625,6 +675,68 @@ mod tests {
         assert!(
             log.contains("my test commit message"),
             "Expected commit message in log, got: {log}"
+        );
+    }
+
+    #[test]
+    fn low_signal_matches_lockfiles_by_basename() {
+        assert!(is_low_signal_path("Cargo.lock"));
+        assert!(is_low_signal_path("packages/foo/package-lock.json"));
+        assert!(is_low_signal_path("a/b/yarn.lock"));
+        assert!(is_low_signal_path("assets/app.min.js"));
+        assert!(is_low_signal_path("dist/app.js.map"));
+        assert!(is_low_signal_path("vendor/lib/util.go"));
+        assert!(is_low_signal_path("pkg/node_modules/x/index.js"));
+    }
+
+    #[test]
+    fn low_signal_does_not_match_regular_files() {
+        assert!(!is_low_signal_path("src/main.rs"));
+        assert!(!is_low_signal_path("Cargo.toml"));
+        assert!(!is_low_signal_path("vendor")); // root file named vendor
+        assert!(!is_low_signal_path("src/locks.rs"));
+        assert!(!is_low_signal_path("docs/minjs.md"));
+    }
+
+    #[test]
+    fn ranking_demotes_low_signal_files_below_smaller_signal_files() {
+        let mut entries = vec![
+            (500, 300, "Cargo.lock".to_string()),
+            (10, 2, "src/main.rs".to_string()),
+            (40, 5, "src/diff.rs".to_string()),
+        ];
+        rank_entries(&mut entries);
+        let names: Vec<&str> = entries.iter().map(|(_, _, n)| n.as_str()).collect();
+        assert_eq!(names, vec!["src/diff.rs", "src/main.rs", "Cargo.lock"]);
+    }
+
+    #[test]
+    fn stat_ranked_marks_low_signal_files() {
+        let repo = init_repo();
+        let path = repo.path();
+
+        fs::write(path.join("Cargo.lock"), "big lockfile content\n".repeat(30)).unwrap();
+        fs::write(path.join("main.rs"), "fn main() {}\n").unwrap();
+        Command::new("git")
+            .args(["add", "Cargo.lock", "main.rs"])
+            .current_dir(path)
+            .output()
+            .unwrap();
+
+        let stat = staged_stat_ranked(path).unwrap();
+        let lock_line = stat
+            .lines()
+            .find(|l| l.contains("Cargo.lock"))
+            .expect("Cargo.lock missing from stat");
+        assert!(
+            lock_line.contains("(low-signal)"),
+            "lockfile line should carry low-signal marker:\n{stat}"
+        );
+        let main_pos = stat.find("main.rs").unwrap();
+        let lock_pos = stat.find("Cargo.lock").unwrap();
+        assert!(
+            main_pos < lock_pos,
+            "signal file should outrank bigger lockfile:\n{stat}"
         );
     }
 

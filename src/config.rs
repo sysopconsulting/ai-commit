@@ -101,9 +101,9 @@ fn validate(cfg: Config) -> Result<Config> {
     }
 
     match cfg.diff_mode.as_str() {
-        "auto" | "full" | "compact" | "stat" => {}
+        "auto" | "full" | "compact" | "budgeted" | "stat" => {}
         other => anyhow::bail!(
-            "unknown diff_mode: {other}. Use \"auto\", \"full\", \"compact\", or \"stat\"."
+            "unknown diff_mode: {other}. Use \"auto\", \"full\", \"compact\", \"budgeted\", or \"stat\"."
         ),
     }
 
@@ -434,6 +434,16 @@ emoji = true
             err.to_string().contains("unknown provider"),
             "Expected provider validation error, got: {err}"
         );
+    }
+
+    #[test]
+    fn test_budgeted_diff_mode_accepted() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("config.toml");
+
+        set_value(&path, "diff_mode", "budgeted").unwrap();
+        let cfg = load_from_path(&path).unwrap();
+        assert_eq!(cfg.diff_mode, "budgeted");
     }
 
     #[test]
