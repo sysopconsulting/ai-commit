@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use std::io::IsTerminal;
 
 pub mod config;
 pub mod diff;
@@ -63,10 +64,31 @@ mod cli_tests {
     }
 
     #[test]
-    fn unchanged_streamed_message_is_not_printed_again() {
-        assert!(!should_print_cleaned_message(
+    fn unchanged_streamed_message_is_not_printed_again_on_a_terminal() {
+        assert!(!should_print_final_to_stdout(
+            true,
             "feat(.): ignore target and .codex files\n",
             "feat(.): ignore target and .codex files"
+        ));
+    }
+
+    #[test]
+    fn cleaned_message_is_reprinted_on_a_terminal_when_it_differs() {
+        assert!(should_print_final_to_stdout(
+            true,
+            "Here is the message:\nfeat: add x",
+            "feat: add x"
+        ));
+    }
+
+    #[test]
+    fn piped_stdout_always_receives_the_final_message() {
+        // A consumer reading stdout must get exactly one complete message,
+        // even when it matches what was streamed to stderr.
+        assert!(should_print_final_to_stdout(
+            false,
+            "feat: add x",
+            "feat: add x"
         ));
     }
 
@@ -128,8 +150,14 @@ fn should_offer_stage_when_no_staged(hook: bool) -> bool {
     !hook
 }
 
-fn should_print_cleaned_message(raw_message: &str, cleaned_message: &str) -> bool {
-    cleaned_message != raw_message.trim()
+/// stdout carries the machine-readable result; the live stream goes to stderr.
+///
+/// When stdout is not a terminal (piped, redirected, captured by a script) the
+/// cleaned message is always written, so consumers get exactly one complete,
+/// validated message. On a terminal the user already watched it stream, so it
+/// is reprinted only when cleaning actually changed it.
+fn should_print_final_to_stdout(stdout_is_terminal: bool, displayed: &str, cleaned: &str) -> bool {
+    !stdout_is_terminal || cleaned != displayed.trim()
 }
 
 fn validate_generated_message(message: &str) -> Result<()> {
@@ -142,6 +170,19 @@ fn validate_generated_message(message: &str) -> Result<()> {
         anyhow::bail!("provider returned a non-conventional commit message: {first_line}");
     }
     Ok(())
+}
+
+/// Advisory: an over-long subject is still a usable commit, so this warns
+/// rather than failing — aborting a commit (or a prepare-commit-msg hook) over
+/// a cosmetic rule would be worse than the defect.
+fn warn_if_subject_too_long(message: &str) {
+    if prompt::first_line_too_long(message) {
+        let n = message.lines().next().unwrap_or_default().chars().count();
+        eprintln!(
+            "  warning: subject is {n} characters (conventional limit is {}).",
+            prompt::MAX_SUBJECT_CHARS
+        );
+    }
 }
 
 async fn generate(cli: &Cli) -> Result<()> {
@@ -177,6 +218,7 @@ async fn generate(cli: &Cli) -> Result<()> {
 
     let detected_scope = scope::detect_scope(&files);
     let system_prompt = prompt::build_system_prompt(&cfg, detected_scope.as_deref());
+    let trailing_instruction = prompt::build_trailing_instruction(&cfg, detected_scope.as_deref());
     let (initial_diff, initial_mode) = diff::fit_diff(&repo, cfg.max_input_tokens, &cfg.diff_mode)?;
 
     let provider = llm::Provider::from_config(&cfg)?;
@@ -194,6 +236,11 @@ async fn generate(cli: &Cli) -> Result<()> {
         if let Some(ctx) = &cli.context {
             user_content = format!("Context: {ctx}\n\n{user_content}");
         }
+        // The format spec goes LAST, after the diff: local models drop
+        // system-prompt rules across a long diff, and recency is what makes
+        // them comply. Joined with a blank line because a truncated or stat
+        // diff is not guaranteed to end in a newline.
+        user_content = format!("{}\n\n{trailing_instruction}", user_content.trim_end());
 
         let messages = vec![
             llm::Message {
@@ -234,10 +281,14 @@ async fn generate(cli: &Cli) -> Result<()> {
         let streamed = ui::stream_message(&mut stream, show_thinking).await?;
         let message = prompt::clean_message(&streamed.raw);
         validate_generated_message(&message)?;
+        warn_if_subject_too_long(&message);
 
-        // Reprint only when cleaning changed what the user actually saw
-        if should_print_cleaned_message(&streamed.displayed, &message) {
-            eprintln!("\n  (cleaned)\n{message}");
+        if should_print_final_to_stdout(
+            std::io::stdout().is_terminal(),
+            &streamed.displayed,
+            &message,
+        ) {
+            println!("{message}");
         }
 
         // Hook mode: write to commit message file and exit

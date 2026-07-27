@@ -77,8 +77,8 @@ acm hook uninstall           # remove acm's hook
 ## Interactive Workflow
 
 With staged changes, `acm` first shows the staged diff in your pager. After you
-quit the pager, the generated commit message streams once, then the action
-prompt appears:
+quit the pager, the generated commit message streams once to stderr, then the
+action prompt appears:
 
 ```text
 $ acm
@@ -330,8 +330,24 @@ Models sometimes add prose around the answer. `acm` cleans common cases:
 - "Here is a commit message" preambles
 - Trailing explanatory notes
 
-If cleanup changes what was displayed during streaming, `acm` prints the
-cleaned message before continuing.
+A `<think>` that a message merely *mentions* — inside a bullet, say — is left
+alone; only genuine reasoning spans are stripped.
+
+## Output Streams
+
+`acm` separates the two kinds of output:
+
+- **stderr** carries live progress: the streamed tokens, the `(thinking…)`
+  note, warnings, and errors.
+- **stdout** carries the result: the cleaned, validated commit message.
+
+So `acm --dry-run > msg.txt` always captures exactly one complete, validated
+message, and never partially-filtered text. On a terminal the message has
+already been shown while streaming, so it is only reprinted when cleanup
+changed it.
+
+If the model's subject line exceeds the conventional 72-character limit, `acm`
+warns on stderr but still offers the message — the limit is advisory.
 
 ## Troubleshooting
 
@@ -344,6 +360,23 @@ cleaned message before continuing.
 | Provider rejects context | Lower `max_input_tokens`, or use `diff_mode=budgeted` / `diff_mode=stat` |
 | Editor does not open | Set `$EDITOR`, for example `export EDITOR="vim"` |
 | Hook does not install | Check for an existing non-`acm` hook |
+| `model returned a tool call` | That model answers with function calls; use a coder/instruct model |
+| `output hit the ... token cap` | Model rambled past the cap; re-run, or pick a model that follows the format |
+| Non-conventional message | Small models (≤4B) often cannot hold the format; try a larger coder model |
+
+### Choosing a local model
+
+The message quality depends heavily on the model. A `--dry-run` smoke check
+across three real changesets lives in `scripts/smoke-local.sh`:
+
+```bash
+cargo build --release
+scripts/smoke-local.sh qwen3-coder:30b
+```
+
+It asserts only that each result is a well-formed conventional commit with a
+subject within 72 characters and a bulleted (not prose) body, so it is a
+usable way to compare candidate models on your own hardware.
 
 ## Development
 

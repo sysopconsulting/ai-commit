@@ -60,6 +60,57 @@ pub fn build_system_prompt(config: &Config, scope: Option<&str>) -> String {
     lines.join("\n")
 }
 
+/// Builds the instruction block appended to the user turn, AFTER the diff.
+///
+/// This deliberately restates the format rules already present in
+/// [`build_system_prompt`]. Local models reliably drop system-prompt rules
+/// across a multi-thousand-token diff and start continuing the code or writing
+/// a PR description instead; repeating the format at the point of generation
+/// is what makes them comply. Both builders read the same [`Config`] so the two
+/// copies stay in agreement.
+pub fn build_trailing_instruction(config: &Config, scope: Option<&str>) -> String {
+    let header = if scope.is_some() {
+        "Line 1: <type>(<scope>): <subject> — imperative, lowercase, at most 72 characters."
+    } else {
+        "Line 1: <type>: <subject> — imperative, lowercase, at most 72 characters."
+    };
+
+    let mut lines = vec![
+        "--- end of diff ---".to_string(),
+        "Write the conventional commit message for the staged changes above.".to_string(),
+        header.to_string(),
+    ];
+
+    if config.one_line {
+        lines.push("Output a single line only, with no body.".to_string());
+    } else {
+        lines.push(
+            "If the commit contains several distinct changes, add a blank line then 2-6 lines each starting with \"- \", one per logical change. Omit the body when it would only restate the subject. No prose paragraphs."
+                .to_string(),
+        );
+    }
+
+    if let Some(s) = scope {
+        lines.push(format!(
+            "Use the scope \"{s}\" unless the changes clearly warrant a different one."
+        ));
+    }
+
+    if config.emoji {
+        // The emoji must follow "<type>: " so the header stays parseable by
+        // is_commit_line — a leading emoji would fail validation.
+        lines.push("Place a relevant emoji immediately after \": \", not before the type.".to_string());
+    }
+
+    if config.language != "en" {
+        lines.push(format!("Write the message in language: {}", config.language));
+    }
+
+    lines.push("Output only the commit message.".to_string());
+
+    lines.join("\n")
+}
+
 /// Conventional commit type prefixes.
 const TYPES: &[&str] = &[
     "fix", "feat", "refactor", "docs", "test", "chore", "style", "perf", "build", "ci",
@@ -140,6 +191,63 @@ pub(crate) fn could_be_think_tag_prefix(s: &str) -> bool {
     tail[ING.len()].is_ascii_whitespace()
 }
 
+/// Decide which scanned think tags are real reasoning markers rather than a
+/// commit message that merely *mentions* `<think>` in its text.
+///
+/// * A **paired** opener always counts — reasoning models emit inline pairs
+///   like `<think>first</think>fix: ...` with no newlines.
+/// * An **unmatched** opener counts only when it is line-leading, or when no
+///   conventional-commit line precedes it. A bare `<think>` sitting mid-line
+///   after a valid header is prose (e.g. a bullet describing this very
+///   feature), and stripping from it would destroy the message.
+///
+/// Known limitation: a literal *paired* mention inside prose
+/// (``- filter `<think>...</think>` spans``) is still stripped, mangling that
+/// line. Distinguishing it from genuine inline reasoning is not possible
+/// without understanding the prose, and inline pairs must keep being stripped.
+fn keep_reasoning_tags(
+    text: &str,
+    tags: Vec<(usize, usize, bool)>,
+) -> Vec<(usize, usize, bool)> {
+    // Match openers to closers so we know which openers are paired.
+    let mut paired = vec![false; tags.len()];
+    let mut open_stack: Vec<usize> = Vec::new();
+    for (i, (_, _, closing)) in tags.iter().enumerate() {
+        if *closing {
+            if let Some(j) = open_stack.pop() {
+                paired[i] = true;
+                paired[j] = true;
+            }
+        } else {
+            open_stack.push(i);
+        }
+    }
+
+    tags.iter()
+        .enumerate()
+        .filter(|(i, (start, _, closing))| {
+            if *closing || paired[*i] {
+                return true;
+            }
+            is_line_leading(text, *start) || !has_commit_line_before(text, *start)
+        })
+        .map(|(_, t)| *t)
+        .collect()
+}
+
+/// True when only whitespace separates `pos` from the start of its line.
+fn is_line_leading(text: &str, pos: usize) -> bool {
+    let line_start = text[..pos].rfind('\n').map(|i| i + 1).unwrap_or(0);
+    text[line_start..pos].trim().is_empty()
+}
+
+/// True when a conventional-commit line appears strictly before `pos`.
+fn has_commit_line_before(text: &str, pos: usize) -> bool {
+    let head = &text[..pos];
+    let complete = head.rfind('\n').map(|i| &head[..i]).unwrap_or("");
+    complete.lines().any(is_commit_line)
+}
+
 /// Remove `<think>...</think>` reasoning spans (reasoning models like qwen3
 /// and deepseek-r1 emit them).
 ///
@@ -161,6 +269,7 @@ fn strip_think_blocks(text: &str) -> String {
             i = pos + 1;
         }
     }
+    let tags = keep_reasoning_tags(text, tags);
     if tags.is_empty() {
         return text.to_string();
     }
@@ -262,15 +371,55 @@ pub fn clean_message(raw: &str) -> String {
     }
 }
 
+/// True for a well-formed conventional-commit header:
+/// `<type>` `("(" <scope> ")")?` `"!"?` `": "` `<subject>`.
+///
+/// Stricter than a prefix check because `--yes` and hook mode commit whatever
+/// passes: `fix(broken subject`, `fix(: x` and a bare `fix:` are rejected.
+/// The optional `!` is the conventional-commits breaking-change marker
+/// (`feat!: ...`, `feat(api)!: ...`).
 fn is_commit_line(line: &str) -> bool {
     let lower = line.trim().to_lowercase();
-    TYPES
+    let Some(rest) = TYPES
         .iter()
-        .any(|t| lower.starts_with(&format!("{t}:")) || lower.starts_with(&format!("{t}(")))
+        .find_map(|t| lower.strip_prefix(*t).filter(|r| r.starts_with([':', '(', '!'])))
+    else {
+        return false;
+    };
+
+    // Optional "(scope)" — must be non-empty and closed.
+    let rest = match rest.strip_prefix('(') {
+        Some(after_paren) => match after_paren.split_once(')') {
+            Some((scope, tail)) if !scope.trim().is_empty() && !scope.contains('(') => tail,
+            _ => return false,
+        },
+        None => rest,
+    };
+
+    // Optional breaking-change marker.
+    let rest = rest.strip_prefix('!').unwrap_or(rest);
+
+    // Required ": " followed by a non-empty subject.
+    matches!(rest.strip_prefix(':'), Some(subject) if !subject.trim().is_empty())
 }
 
 pub fn is_conventional_commit_message(message: &str) -> bool {
     message.lines().next().map(is_commit_line).unwrap_or(false)
+}
+
+/// Conventional commits cap the subject at 72 characters. Counted in `chars`,
+/// not bytes, so emoji and non-English subjects are measured correctly.
+///
+/// Advisory only: an over-long subject is still a usable commit message, so
+/// callers warn rather than fail.
+pub const MAX_SUBJECT_CHARS: usize = 72;
+
+pub fn first_line_too_long(message: &str) -> bool {
+    message
+        .lines()
+        .next()
+        .map(|l| l.chars().count() > MAX_SUBJECT_CHARS)
+        .unwrap_or(false)
 }
 
 fn is_commentary(line: &str) -> bool {
@@ -565,6 +714,38 @@ mod tests {
         assert_eq!(clean_message(raw), "feat: add retry ladder");
     }
 
+    // ── think-tag discriminator ─────────────────────────────────────────────
+
+    #[test]
+    fn clean_preserves_inline_think_mention_in_a_body() {
+        // The bug this discriminator exists for: a valid message whose body
+        // *describes* think-stripping must not be truncated at the mention.
+        let raw = "feat: add streaming filter\n\n- filter `<think>` spans from streamed output\n- keep the rest intact";
+        assert_eq!(clean_message(raw), raw);
+    }
+
+    #[test]
+    fn clean_strips_nested_think_blocks() {
+        let raw = "<think>outer <think>inner</think> tail</think>\nfeat: add x";
+        assert_eq!(clean_message(raw), "feat: add x");
+    }
+
+    #[test]
+    fn clean_strips_midline_unclosed_think_when_no_commit_precedes_it() {
+        // No header before the opener, so it is reasoning: the hypothetical
+        // commit line inside it must NOT be extracted as the message.
+        let raw = "Reasoning: <think>\nfix: hypothetical thing";
+        let cleaned = clean_message(raw);
+        assert!(
+            !cleaned.contains("hypothetical"),
+            "must not extract a commit line from inside reasoning, got: {cleaned}"
+        );
+        assert!(
+            !is_conventional_commit_message(&cleaned),
+            "result should fail validation loudly rather than look valid"
+        );
+    }
+
     #[test]
     fn clean_strips_wrapping_quotes() {
         assert_eq!(clean_message("\"feat: add x\""), "feat: add x");
@@ -600,5 +781,120 @@ mod tests {
         assert!(!could_be_think_tag_prefix("<div"));
         assert!(!could_be_think_tag_prefix("<thinkx"));
         assert!(!could_be_think_tag_prefix("<think>")); // complete, not a prefix
+    }
+
+    // ── header grammar ──────────────────────────────────────────────────────
+
+    #[test]
+    fn commit_line_grammar_accepts_and_rejects() {
+        for good in [
+            "fix: handle empty output",
+            "feat(auth): add login",
+            "feat!: remove deprecated api",
+            "feat(api)!: remove deprecated endpoint",
+            "chore(deps-dev): bump serde",
+            "FIX: uppercase type is fine",
+        ] {
+            assert!(is_commit_line(good), "should accept: {good}");
+        }
+        for bad in [
+            "fix(broken subject",   // unclosed scope
+            "fix(: nonsense",       // empty scope
+            "fix:",                 // no subject
+            "fix:   ",              // whitespace-only subject
+            "fixture: not a type",  // type must match exactly
+            "update the readme",    // no type at all
+            "",
+        ] {
+            assert!(!is_commit_line(bad), "should reject: {bad}");
+        }
+    }
+
+    // ── subject length (advisory) ───────────────────────────────────────────
+
+    #[test]
+    fn subject_length_is_measured_in_chars_not_bytes() {
+        let exactly_72 = format!("fix: {}", "a".repeat(67));
+        assert_eq!(exactly_72.chars().count(), 72);
+        assert!(!first_line_too_long(&exactly_72), "72 is allowed");
+
+        let seventy_three = format!("fix: {}", "a".repeat(68));
+        assert!(first_line_too_long(&seventy_three), "73 is too long");
+
+        // 40 multibyte chars = 120 bytes, but well under the 72-char limit.
+        let multibyte = format!("fix: {}", "日".repeat(40));
+        assert!(multibyte.len() > 72, "precondition: byte length exceeds 72");
+        assert!(
+            !first_line_too_long(&multibyte),
+            "chars, not bytes, must be counted"
+        );
+
+        // Only the first line is measured.
+        let long_body = format!("fix: short subject\n\n- {}", "b".repeat(200));
+        assert!(!first_line_too_long(&long_body));
+    }
+
+    // ── trailing instruction ────────────────────────────────────────────────
+
+    fn cfg() -> Config {
+        Config::default()
+    }
+
+    #[test]
+    fn trailing_instruction_is_scope_aware() {
+        let with = build_trailing_instruction(&cfg(), Some("diff"));
+        assert!(with.contains("<type>(<scope>): <subject>"));
+        assert!(with.contains("Use the scope \"diff\""));
+
+        let without = build_trailing_instruction(&cfg(), None);
+        assert!(without.contains("<type>: <subject>"));
+        assert!(!without.contains("<scope>"));
+    }
+
+    #[test]
+    fn trailing_instruction_body_rule_is_conditional_not_mandatory() {
+        // Must agree with the system prompt, which allows omitting the body.
+        let out = build_trailing_instruction(&cfg(), None);
+        assert!(out.contains("If the commit contains several distinct changes"));
+        assert!(out.contains("Omit the body when it would only restate the subject"));
+    }
+
+    #[test]
+    fn trailing_instruction_honours_one_line() {
+        let config = Config {
+            one_line: true,
+            ..cfg()
+        };
+        let out = build_trailing_instruction(&config, None);
+        assert!(out.contains("single line only"));
+        assert!(!out.contains("2-6 lines"));
+    }
+
+    #[test]
+    fn trailing_instruction_honours_emoji_and_language() {
+        let config = Config {
+            emoji: true,
+            language: "ro".to_string(),
+            ..cfg()
+        };
+        let out = build_trailing_instruction(&config, None);
+        // Emoji must go after ": " or the header would fail is_commit_line.
+        assert!(out.contains("immediately after \": \""));
+        assert!(out.contains("language: ro"));
+    }
+
+    #[test]
+    fn trailing_instruction_ends_with_the_output_directive() {
+        let out = build_trailing_instruction(&cfg(), None);
+        assert!(out.starts_with("--- end of diff ---"));
+        assert!(out.trim_end().ends_with("Output only the commit message."));
+    }
+
+    #[test]
+    fn emoji_instruction_keeps_the_header_parseable() {
+        // Guards the interaction between the emoji rule and the tightened
+        // grammar: emoji after ": " parses, emoji before the type does not.
+        assert!(is_commit_line("feat: ✨ add sparkles"));
+        assert!(!is_commit_line("✨ feat: add sparkles"));
     }
 }

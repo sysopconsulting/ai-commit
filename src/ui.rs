@@ -124,6 +124,13 @@ impl ThinkFilter {
     }
 }
 
+/// Stream the provider response to **stderr** as live progress.
+///
+/// stderr, not stdout: stdout carries only the final cleaned and validated
+/// message (see `main`). That split is what guarantees a consumer piping
+/// stdout can never receive partially-filtered or unvalidated text, and it is
+/// why this display filter only has to be good enough to look right — it is
+/// not load-bearing for correctness.
 pub async fn stream_message(
     stream: &mut TokenStream,
     show_thinking_placeholder: bool,
@@ -131,15 +138,24 @@ pub async fn stream_message(
     let mut raw = String::new();
     let mut displayed = String::new();
     let mut filter = ThinkFilter::new();
-    let stdout = io::stdout();
-    let mut out = stdout.lock();
+    let stderr = io::stderr();
+    let mut out = stderr.lock();
 
     while let Some(token) = stream.next().await {
-        let token = token?;
+        // Terminate the partial line first, so a provider error is not
+        // appended to the half-written candidate.
+        let token = match token {
+            Ok(t) => t,
+            Err(e) => {
+                let _ = writeln!(out);
+                let _ = out.flush();
+                return Err(e);
+            }
+        };
         raw.push_str(&token);
         let (visible, thinking_started) = filter.push(&token);
         if thinking_started && show_thinking_placeholder {
-            eprintln!("  (thinking…)");
+            writeln!(out, "  (thinking…)")?;
         }
         if !visible.is_empty() {
             out.write_all(visible.as_bytes())?;
